@@ -109,6 +109,18 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// Marca atividade no chat sem destruir o nome já conhecido: o nome só é gravado
+// quando a linha nasce (chat novo, iniciado por nós). StoreChat é INSERT OR REPLACE
+// e sobrescreveria um nome bom pelo fallback, então não serve pro caminho de envio.
+func (store *MessageStore) TouchChat(jid, fallbackName string, lastMessageTime time.Time) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET last_message_time = excluded.last_message_time`,
+		jid, fallbackName, lastMessageTime,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -374,16 +386,27 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// grava, e ele só roda no recebimento. Sem isto a mensagem sai no WhatsApp e nunca
 	// entra no store: a thread fica só com o lado deles. Mesmos extratores do
 	// handleMessage, pra gravar idêntico ao caminho de recebimento.
+	chatJID := recipientJID.String()
+
+	// TouchChat ANTES do StoreMessage: o db abre com _foreign_keys=on e messages.chat_jid
+	// referencia chats.jid, então numa conversa nova (iniciada por nós) a mensagem seria
+	// rejeitada por FK. O fallback só vale pra linha nova; conversa existente mantém o
+	// nome dela. Nome bom sem ida à rede: o contato do store local, senão o número.
+	fallbackName := recipientJID.User
+	if contact, err := client.Store.Contacts.GetContact(context.Background(), recipientJID); err == nil && contact.FullName != "" {
+		fallbackName = contact.FullName
+	}
+	if err := messageStore.TouchChat(chatJID, fallbackName, resp.Timestamp); err != nil {
+		fmt.Printf("Warning: message sent but chat not touched: %v\n", err)
+	}
+
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
-	if err := messageStore.StoreMessage(resp.ID, recipientJID.String(), client.Store.ID.User,
+	if err := messageStore.StoreMessage(resp.ID, chatJID, client.Store.ID.User,
 		extractTextContent(msg), resp.Timestamp, true,
 		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
 		// enviada de verdade — não falha a request, mas avisa que a cópia local faltou
 		fmt.Printf("Warning: message sent but not stored locally: %v\n", err)
 	}
-	// não mexemos em chats.last_message_time: os leitores ordenam por MAX(messages.timestamp).
-	// Se algum consumidor passar a ler chats direto, é aqui que entra um StoreChat
-	// (com o nome atual — StoreChat é INSERT OR REPLACE e apagaria o nome se vier vazio).
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
