@@ -205,7 +205,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -364,11 +364,26 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
+
+	// whatsmeow NÃO emite events.Message pro que nós mesmos mandamos — só handleMessage
+	// grava, e ele só roda no recebimento. Sem isto a mensagem sai no WhatsApp e nunca
+	// entra no store: a thread fica só com o lado deles. Mesmos extratores do
+	// handleMessage, pra gravar idêntico ao caminho de recebimento.
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if err := messageStore.StoreMessage(resp.ID, recipientJID.String(), client.Store.ID.User,
+		extractTextContent(msg), resp.Timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		// enviada de verdade — não falha a request, mas avisa que a cópia local faltou
+		fmt.Printf("Warning: message sent but not stored locally: %v\n", err)
+	}
+	// não mexemos em chats.last_message_time: os leitores ordenam por MAX(messages.timestamp).
+	// Se algum consumidor passar a ler chats direto, é aqui que entra um StoreChat
+	// (com o nome atual — StoreChat é INSERT OR REPLACE e apagaria o nome se vier vazio).
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
@@ -812,7 +827,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
