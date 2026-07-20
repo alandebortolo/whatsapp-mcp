@@ -6,10 +6,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -408,14 +410,115 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// --- Transcrição automática de áudios recebidos (Whisper local) ---
+
+var whisperModelPath = func() string {
+	if p := os.Getenv("WHISPER_MODEL"); p != "" {
+		return p
+	}
+	return "/Users/alandebortolo/Dev/whatsapp-mcp/ggml-large-v3-turbo.bin"
+}()
+
+// ponytail: semáforo global de 1 slot — whisper carrega ~500MB por processo;
+// áudios em rajada transcrevem em série. Subir o cap se virar gargalo.
+var transcribeSem = make(chan struct{}, 1)
+
+// transcribeAndReply baixa o áudio, transcreve via whisper.cpp local e
+// responde na própria conversa citando a mensagem de áudio.
+func transcribeAndReply(client *whatsmeow.Client, msg *events.Message, chat types.JID, logger waLog.Logger) {
+	// Evita rajada de replies atrasados se o bridge ficou fora do ar
+	if time.Since(msg.Info.Timestamp) > 15*time.Minute {
+		return
+	}
+	aud := msg.Message.GetAudioMessage()
+	if aud == nil {
+		return
+	}
+
+	transcribeSem <- struct{}{}
+	defer func() { <-transcribeSem }()
+
+	data, err := client.Download(context.Background(), aud)
+	if err != nil {
+		logger.Warnf("transcricao: falha no download do audio: %v", err)
+		return
+	}
+
+	tmpDir, err := os.MkdirTemp("", "wamcp-audio-*")
+	if err != nil {
+		logger.Warnf("transcricao: falha ao criar tmpdir: %v", err)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	ogg := filepath.Join(tmpDir, "audio.ogg")
+	wav := filepath.Join(tmpDir, "audio.wav")
+	if err := os.WriteFile(ogg, data, 0600); err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	// Caminhos absolutos: launchd não tem /opt/homebrew/bin no PATH
+	if out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/ffmpeg",
+		"-y", "-i", ogg, "-ar", "16000", "-ac", "1", wav).CombinedOutput(); err != nil {
+		logger.Warnf("transcricao: ffmpeg falhou: %v (%s)", err, out)
+		return
+	}
+
+	out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/whisper-cli",
+		"-m", whisperModelPath, "-f", wav, "-l", "pt", "-nt", "-np").Output()
+	if err != nil {
+		logger.Warnf("transcricao: whisper falhou: %v", err)
+		return
+	}
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return
+	}
+
+	reply := &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String("📝 *Transcrição automática:*\n" + text),
+			ContextInfo: &waProto.ContextInfo{
+				StanzaID:      proto.String(msg.Info.ID),
+				Participant:   proto.String(msg.Info.Sender.ToNonAD().String()),
+				QuotedMessage: msg.Message,
+			},
+		},
+	}
+	if _, err := client.SendMessage(context.Background(), chat, reply); err != nil {
+		logger.Warnf("transcricao: falha ao enviar reply: %v", err)
+	} else {
+		logger.Infof("transcricao enviada para %s (%d chars)", chat.String(), len(text))
+	}
+}
+
+// resolveJID maps a LID JID (WhatsApp's post-2026 privacy identifier) back to
+// the phone-number JID via whatsmeow's lid_map, so each conversation keeps a
+// single identity in the local DB. Returns the input unchanged when there is
+// no mapping (or the JID is not a LID).
+func resolveJID(client *whatsmeow.Client, jid types.JID) types.JID {
+	if jid.Server != types.HiddenUserServer {
+		return jid
+	}
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid.ToNonAD())
+	if err != nil || pn.IsEmpty() {
+		return jid
+	}
+	return pn
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Save message to database (normalizing LID -> phone-number JID)
+	chat := resolveJID(client, msg.Info.Chat)
+	chatJID := chat.String()
+	sender := resolveJID(client, msg.Info.Sender).User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -466,6 +569,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		}
+
+		// Transcrição automática: só áudio recebido em conversa 1:1
+		if mediaType == "audio" && !msg.Info.IsFromMe && chat.Server == types.DefaultUserServer {
+			go transcribeAndReply(client, msg, chat, logger)
 		}
 	}
 }
@@ -641,7 +749,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -668,10 +776,8 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep query parameters: the CDN auth tokens (ccb/oh/oe) live there and
+	// stripping them makes WhatsApp return 403 on download
 	return "/" + pathPart
 }
 
@@ -774,6 +880,56 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for profile pictures (avatars). GET /api/avatar?jid=<jid>
+	// 404 means "no picture available" (not set, or hidden by privacy) — callers fall back
+	// to their own placeholder. Returns the preview (thumbnail) size, which is what avatars need.
+	http.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jidStr := r.URL.Query().Get("jid")
+		if jidStr == "" {
+			http.Error(w, "jid is required", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			http.Error(w, "Invalid JID", http.StatusBadRequest)
+			return
+		}
+
+		// Bound the IQ query: for a contact with no picture the server may never answer,
+		// and an unbounded wait would pin a caller (and a goroutine) indefinitely.
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		info, err := client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: true})
+		if err != nil || info == nil || info.URL == "" {
+			// ErrProfilePictureNotSet / ErrProfilePictureUnauthorized land here too
+			http.Error(w, "No profile picture", http.StatusNotFound)
+			return
+		}
+
+		resp, err := http.Get(info.URL) // CDN URL, plain HTTP GET per whatsmeow docs
+		if err != nil {
+			http.Error(w, "Failed to fetch picture", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "Failed to fetch picture", http.StatusBadGateway)
+			return
+		}
+
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "image/jpeg"
+		}
+		w.Header().Set("Content-Type", ct)
+		io.Copy(w, resp.Body)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +956,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -871,6 +1027,7 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				os.WriteFile("qr.txt", []byte(evt.Code), 0600)
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -973,7 +1130,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1145,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1024,6 +1181,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+
+		// Normalize LID -> phone-number JID (see resolveJID)
+		jid = resolveJID(client, jid)
+		chatJID = jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -1089,6 +1250,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
+						// Participant may come as a LID JID string — normalize it
+						if pJID, pErr := types.ParseJID(sender); pErr == nil {
+							sender = resolveJID(client, pJID).User
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {

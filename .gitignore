@@ -1,3 +1,9 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# dados privados e artefatos locais — NUNCA versionar (o fluxo local usa `git add -A`)
+whatsapp-bridge/store/
+whatsapp-bridge/bridge.log
+whatsapp-bridge/whatsapp-bridge
+*.bin
