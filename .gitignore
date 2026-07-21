@@ -8,3 +8,4 @@ whatsapp-bridge/bridge.log
 whatsapp-bridge/whatsapp-bridge
 *.bin
 whatsapp-bridge/*.bak
+claude-flow/
