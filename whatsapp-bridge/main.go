@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"math/rand"
 	"net/http"
 	"os"
@@ -301,7 +302,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			// ponytail: stdlib mime table instead of a hand-kept switch; octet-stream is last resort.
+			// Wrong mime + missing FileName is what made PDFs arrive unopenable ("corrupted").
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -369,6 +375,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
