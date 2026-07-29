@@ -1,6 +1,8 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
+    get_account_info as whatsapp_get_account_info,
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
@@ -16,7 +18,13 @@ from whatsapp import (
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP(os.environ.get("WHATSAPP_MCP_NAME") or "whatsapp")
+
+
+@mcp.tool()
+def get_account_info() -> Dict[str, Any]:
+    """Identify this WhatsApp account and report whether its bridge is connected."""
+    return whatsapp_get_account_info()
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:

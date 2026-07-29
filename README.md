@@ -114,6 +114,33 @@ This application consists of two main components:
 
 2. **Python MCP Server** (`whatsapp-mcp-server/`): A Python server implementing the Model Context Protocol (MCP), which provides standardized tools for Claude to interact with WhatsApp data and send/receive messages.
 
+### Multiple isolated accounts
+
+The bridge and MCP server support multiple accounts on the same machine. Each
+account must use its own session store and REST port. Never point two bridge
+processes at the same store.
+
+Bridge environment variables:
+
+- `WHATSAPP_ACCOUNT_NAME`: human-readable account label.
+- `WHATSAPP_STORE_DIR`: isolated directory containing `whatsapp.db`,
+  `messages.db`, and downloaded media.
+- `WHATSAPP_QR_PATH`: file that receives the current raw pairing QR code.
+- `WHATSAPP_BRIDGE_BIND`: bind address. Use `127.0.0.1` for local MCP access.
+- `WHATSAPP_BRIDGE_PORT`: unique REST port. The default remains `8080`.
+- `WHATSAPP_AUTO_TRANSCRIBE`: whether received direct-message audio is
+  automatically transcribed and replied to. The default remains `true`.
+
+MCP server environment variables:
+
+- `WHATSAPP_MCP_NAME`: internal MCP server name.
+- `WHATSAPP_ACCOUNT_NAME`: the label returned by `get_account_info`.
+- `WHATSAPP_MESSAGES_DB_PATH`: the account-specific `messages.db`.
+- `WHATSAPP_API_BASE_URL`: the account-specific bridge URL, including `/api`.
+
+All variables are optional, and their defaults preserve the original
+single-account installation.
+
 ### Data Storage
 
 - All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory

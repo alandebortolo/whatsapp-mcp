@@ -8,14 +8,16 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"mime"
 	"math/rand"
+	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +36,79 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	defaultStoreDir   = "store"
+	defaultBridgePort = 8080
+)
+
+type runtimeConfig struct {
+	AccountName    string
+	StoreDir       string
+	QRPath         string
+	BindAddress    string
+	Port           int
+	AutoTranscribe bool
+}
+
+func loadRuntimeConfig() (runtimeConfig, error) {
+	cfg := runtimeConfig{
+		AccountName:    strings.TrimSpace(os.Getenv("WHATSAPP_ACCOUNT_NAME")),
+		StoreDir:       strings.TrimSpace(os.Getenv("WHATSAPP_STORE_DIR")),
+		QRPath:         strings.TrimSpace(os.Getenv("WHATSAPP_QR_PATH")),
+		BindAddress:    strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_BIND")),
+		Port:           defaultBridgePort,
+		AutoTranscribe: true,
+	}
+	if cfg.AccountName == "" {
+		cfg.AccountName = "whatsapp"
+	}
+	if cfg.StoreDir == "" {
+		cfg.StoreDir = defaultStoreDir
+	}
+	if cfg.QRPath == "" {
+		if cfg.StoreDir == defaultStoreDir {
+			cfg.QRPath = "qr.txt"
+		} else {
+			cfg.QRPath = filepath.Join(filepath.Dir(cfg.StoreDir), "qr.txt")
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_PORT")); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port < 1 || port > 65535 {
+			return runtimeConfig{}, fmt.Errorf("invalid WHATSAPP_BRIDGE_PORT %q", raw)
+		}
+		cfg.Port = port
+	}
+	if raw := strings.TrimSpace(os.Getenv("WHATSAPP_AUTO_TRANSCRIBE")); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return runtimeConfig{}, fmt.Errorf("invalid WHATSAPP_AUTO_TRANSCRIBE %q", raw)
+		}
+		cfg.AutoTranscribe = enabled
+	}
+	return cfg, nil
+}
+
+func sqliteDSN(path string) string {
+	return "file:" + filepath.ToSlash(path) + "?_foreign_keys=on"
+}
+
+func acquireInstanceLock(storeDir string) (*os.File, error) {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	}
+	lockPath := filepath.Join(storeDir, "bridge.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open instance lock: %v", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lockFile.Close()
+		return nil, fmt.Errorf("another bridge is already using store %s", storeDir)
+	}
+	return lockFile, nil
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -46,18 +121,19 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db       *sql.DB
+	storeDir string
 }
 
 // Initialize message store
-func NewMessageStore() (*MessageStore, error) {
+func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", sqliteDSN(filepath.Join(storeDir, "messages.db")))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -93,7 +169,7 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	return &MessageStore{db: db, storeDir: storeDir}, nil
 }
 
 // Close the database connection
@@ -564,7 +640,7 @@ func resolveJID(client *whatsmeow.Client, jid types.JID) types.JID {
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger, autoTranscribe bool) {
 	// Save message to database (normalizing LID -> phone-number JID)
 	chat := resolveJID(client, msg.Info.Chat)
 	chatJID := chat.String()
@@ -625,7 +701,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		// Transcrição automática: só áudio recebido em conversa 1:1
-		if mediaType == "audio" && !msg.Info.IsFromMe && chat.Server == types.DefaultUserServer {
+		if autoTranscribe && mediaType == "audio" && !msg.Info.IsFromMe && chat.Server == types.DefaultUserServer {
 			go transcribeAndReply(client, msg, chat, logger)
 		}
 	}
@@ -723,7 +799,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(messageStore.storeDir, strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -835,9 +911,31 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindAddress string, port int, accountName string) error {
+	mux := http.NewServeMux()
+
+	// Read-only status endpoint used to verify that each isolated account is healthy.
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jid := ""
+		if client.Store.ID != nil {
+			jid = client.Store.ID.ToNonAD().String()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"account":   accountName,
+			"connected": client.IsConnected(),
+			"logged_in": client.IsLoggedIn(),
+			"jid":       jid,
+		})
+	})
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -883,7 +981,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -936,7 +1034,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for profile pictures (avatars). GET /api/avatar?jid=<jid>
 	// 404 means "no picture available" (not set, or hidden by privacy) — callers fall back
 	// to their own placeholder. Returns the preview (thumbnail) size, which is what avatars need.
-	http.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -984,32 +1082,58 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("%s:%d", bindAddress, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+
+	listener, err := net.Listen("tcp", serverAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %v", serverAddr, err)
+	}
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+	return nil
 }
 
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
-	logger.Infof("Starting WhatsApp client...")
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		logger.Errorf("Invalid runtime configuration: %v", err)
+		return
+	}
+	logger.Infof("Starting WhatsApp client for %s (store=%s, bind=%s, port=%d)...",
+		cfg.AccountName, cfg.StoreDir, cfg.BindAddress, cfg.Port)
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
+	// Keep a second process from opening the same WhatsApp session store.
+	lockFile, err := acquireInstanceLock(cfg.StoreDir)
+	if err != nil {
+		logger.Errorf("Failed to lock bridge instance: %v", err)
 		return
 	}
+	defer func() {
+		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		lockFile.Close()
+	}()
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(
+		context.Background(),
+		"sqlite3",
+		sqliteDSN(filepath.Join(cfg.StoreDir, "whatsapp.db")),
+		dbLog,
+	)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -1036,7 +1160,7 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	messageStore, err := NewMessageStore(cfg.StoreDir)
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
@@ -1048,7 +1172,7 @@ func main() {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, v, logger, cfg.AutoTranscribe)
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -1080,7 +1204,9 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				os.WriteFile("qr.txt", []byte(evt.Code), 0600)
+				if err := os.WriteFile(cfg.QRPath, []byte(evt.Code), 0600); err != nil {
+					logger.Warnf("Failed to write QR code to %s: %v", cfg.QRPath, err)
+				}
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -1116,7 +1242,10 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	if err := startRESTServer(client, messageStore, cfg.BindAddress, cfg.Port, cfg.AccountName); err != nil {
+		logger.Errorf("Failed to start REST API server: %v", err)
+		return
+	}
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

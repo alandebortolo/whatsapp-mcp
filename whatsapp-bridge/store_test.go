@@ -2,7 +2,9 @@ package main
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,7 +29,95 @@ func testStore(t *testing.T) *MessageStore {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return &MessageStore{db: db}
+	return &MessageStore{db: db, storeDir: t.TempDir()}
+}
+
+func TestLoadRuntimeConfigDefaults(t *testing.T) {
+	t.Setenv("WHATSAPP_ACCOUNT_NAME", "")
+	t.Setenv("WHATSAPP_STORE_DIR", "")
+	t.Setenv("WHATSAPP_QR_PATH", "")
+	t.Setenv("WHATSAPP_BRIDGE_BIND", "")
+	t.Setenv("WHATSAPP_BRIDGE_PORT", "")
+	t.Setenv("WHATSAPP_AUTO_TRANSCRIBE", "")
+
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccountName != "whatsapp" || cfg.StoreDir != "store" || cfg.QRPath != "qr.txt" {
+		t.Fatalf("unexpected default paths: %+v", cfg)
+	}
+	if cfg.Port != 8080 || cfg.BindAddress != "" || !cfg.AutoTranscribe {
+		t.Fatalf("unexpected default runtime settings: %+v", cfg)
+	}
+}
+
+func TestLoadRuntimeConfigIsolatedAccount(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	qrPath := filepath.Join(root, "account.qr")
+	t.Setenv("WHATSAPP_ACCOUNT_NAME", "Trainer Connect")
+	t.Setenv("WHATSAPP_STORE_DIR", storeDir)
+	t.Setenv("WHATSAPP_QR_PATH", qrPath)
+	t.Setenv("WHATSAPP_BRIDGE_BIND", "127.0.0.1")
+	t.Setenv("WHATSAPP_BRIDGE_PORT", "8081")
+	t.Setenv("WHATSAPP_AUTO_TRANSCRIBE", "false")
+
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccountName != "Trainer Connect" || cfg.StoreDir != storeDir || cfg.QRPath != qrPath {
+		t.Fatalf("unexpected isolated paths: %+v", cfg)
+	}
+	if cfg.Port != 8081 || cfg.BindAddress != "127.0.0.1" || cfg.AutoTranscribe {
+		t.Fatalf("unexpected isolated runtime settings: %+v", cfg)
+	}
+}
+
+func TestLoadRuntimeConfigRejectsInvalidValues(t *testing.T) {
+	t.Setenv("WHATSAPP_BRIDGE_PORT", "8080x")
+	if _, err := loadRuntimeConfig(); err == nil {
+		t.Fatal("expected invalid bridge port to fail")
+	}
+	t.Setenv("WHATSAPP_BRIDGE_PORT", "8081")
+	t.Setenv("WHATSAPP_AUTO_TRANSCRIBE", "sometimes")
+	if _, err := loadRuntimeConfig(); err == nil {
+		t.Fatal("expected invalid auto-transcribe value to fail")
+	}
+}
+
+func TestNewMessageStoreUsesConfiguredDirectory(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "account-store")
+	store, err := NewMessageStore(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	if store.storeDir != storeDir {
+		t.Fatalf("store directory mismatch: %q != %q", store.storeDir, storeDir)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, "messages.db")); err != nil {
+		t.Fatalf("configured messages database was not created: %v", err)
+	}
+}
+
+func TestAcquireInstanceLockRejectsConcurrentStore(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "locked-store")
+	first, err := acquireInstanceLock(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		syscall.Flock(int(first.Fd()), syscall.LOCK_UN)
+		first.Close()
+	})
+
+	if second, err := acquireInstanceLock(storeDir); err == nil {
+		second.Close()
+		t.Fatal("expected a concurrent bridge lock to fail")
+	}
 }
 
 func chatRow(t *testing.T, s *MessageStore, jid string) (string, time.Time) {
