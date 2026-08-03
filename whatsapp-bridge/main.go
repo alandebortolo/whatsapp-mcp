@@ -206,10 +206,22 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
+	// Reentrega da MESMA mensagem (mesmo id no mesmo chat) não é mensagem nova: atualiza
+	// conteúdo e mídia, mas o timestamp continua o da primeira entrega. Com INSERT OR REPLACE
+	// ele pulava para a hora da reentrega, e isso quebrava dois leitores: a mensagem antiga
+	// subia para o topo da conversa e o Clauditor desmarcava "lida" (a marca dele é o maior
+	// timestamp já visto no chat, então um timestamp que anda deixa a conversa não lida para
+	// sempre). Quem reentrega é o remetente insistindo em mensagem sem recibo de leitura —
+	// nosso lado nunca manda recibo.
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender, content = excluded.content, is_from_me = excluded.is_from_me,
+			media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
+			media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err

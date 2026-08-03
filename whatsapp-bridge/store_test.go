@@ -175,6 +175,45 @@ func TestTouchChatCreatesNewAndAllowsMessage(t *testing.T) {
 	}
 }
 
+// Reentrega da mesma mensagem não pode mover o timestamp: era o que deixava a conversa
+// eternamente não lida no Clauditor (auto-reply de escritório reentregue de 8 em 8 min).
+func TestStoreMessageKeepsFirstTimestamp(t *testing.T) {
+	s := testStore(t)
+	jid := "5527998760170@s.whatsapp.net"
+	primeira := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	if err := s.TouchChat(jid, "Contato", primeira); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("MSGID3", jid, jid, "agradece seu contato", primeira, false,
+		"", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// mesma mensagem chegando de novo, agora com a hora da reentrega e a legenda completa
+	if err := s.StoreMessage("MSGID3", jid, jid, "agradece seu contato, como podemos ajudar?",
+		primeira.Add(time.Hour), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var ts time.Time
+	var content string
+	var n int
+	if err := s.db.QueryRow(
+		"SELECT timestamp, content, (SELECT COUNT(*) FROM messages) FROM messages WHERE id = 'MSGID3'").
+		Scan(&ts, &content, &n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("reentrega devia atualizar a linha, não criar outra: %d linhas", n)
+	}
+	if !ts.Equal(primeira) {
+		t.Errorf("timestamp andou com a reentrega: %v != %v", ts, primeira)
+	}
+	if content != "agradece seu contato, como podemos ajudar?" {
+		t.Errorf("conteúdo não foi atualizado: %q", content)
+	}
+}
+
 // Sem o TouchChat antes, a FK rejeita — a regressão que o comentário no envio previne.
 func TestStoreMessageNeedsChatRow(t *testing.T) {
 	s := testStore(t)
