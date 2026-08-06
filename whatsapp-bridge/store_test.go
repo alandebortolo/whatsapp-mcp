@@ -222,3 +222,26 @@ func TestStoreMessageNeedsChatRow(t *testing.T) {
 		t.Error("esperava erro de FK para chat inexistente")
 	}
 }
+
+func TestWhatsAppSendSafeHours(t *testing.T) {
+	local := time.FixedZone("America/Sao_Paulo", -3*60*60)
+	cases := []struct {
+		hour, minute int
+		allowed      bool
+	}{
+		{8, 59, false},
+		{9, 0, true},
+		{19, 59, true},
+		{20, 0, false},
+	}
+	for _, tc := range cases {
+		when := time.Date(2026, 8, 5, tc.hour, tc.minute, 0, 0, local)
+		if got := whatsappSendAllowedAt(when); got != tc.allowed {
+			t.Errorf("%02d:%02d allowed=%v, want %v", tc.hour, tc.minute, got, tc.allowed)
+		}
+	}
+	if got := whatsappQuietHoursMessage(); got !=
+		"envio de WhatsApp bloqueado fora do horário seguro (09:00–19:59, horário local)" {
+		t.Fatalf("mensagem inesperada: %q", got)
+	}
+}

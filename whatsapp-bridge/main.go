@@ -37,9 +37,21 @@ import (
 )
 
 const (
-	defaultStoreDir   = "store"
-	defaultBridgePort = 8080
+	defaultStoreDir       = "store"
+	defaultBridgePort     = 8080
+	whatsappSendStartHour = 9
+	whatsappSendEndHour   = 20
 )
+
+func whatsappSendAllowedAt(now time.Time) bool {
+	hour := now.Hour()
+	return hour >= whatsappSendStartHour && hour < whatsappSendEndHour
+}
+
+func whatsappQuietHoursMessage() string {
+	return fmt.Sprintf("envio de WhatsApp bloqueado fora do horário seguro (%02d:00–%02d:59, horário local)",
+		whatsappSendStartHour, whatsappSendEndHour-1)
+}
 
 type runtimeConfig struct {
 	AccountName    string
@@ -315,6 +327,9 @@ type SendMessageRequest struct {
 
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+	if !whatsappSendAllowedAt(time.Now()) {
+		return false, whatsappQuietHoursMessage()
+	}
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -628,6 +643,10 @@ func transcribeAndReply(client *whatsmeow.Client, msg *events.Message, chat type
 				QuotedMessage: msg.Message,
 			},
 		},
+	}
+	if !whatsappSendAllowedAt(time.Now()) {
+		logger.Infof("transcricao pronta, mas envio bloqueado pelo horario seguro para %s", chat.String())
+		return
 	}
 	if _, err := client.SendMessage(context.Background(), chat, reply); err != nil {
 		logger.Warnf("transcricao: falha ao enviar reply: %v", err)
