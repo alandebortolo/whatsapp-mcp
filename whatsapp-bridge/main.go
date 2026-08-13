@@ -39,8 +39,8 @@ import (
 const (
 	defaultStoreDir       = "store"
 	defaultBridgePort     = 8080
-	whatsappSendStartHour = 9
-	whatsappSendEndHour   = 20
+	whatsappSendStartHour = 6
+	whatsappSendEndHour   = 22
 )
 
 func whatsappSendAllowedAt(now time.Time) bool {
