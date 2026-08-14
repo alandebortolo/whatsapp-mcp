@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -225,14 +226,16 @@ func TestStoreMessageNeedsChatRow(t *testing.T) {
 
 func TestWhatsAppSendSafeHours(t *testing.T) {
 	local := time.FixedZone("America/Sao_Paulo", -3*60*60)
+	// bordas DERIVADAS das constantes: o commit que trocou a janela 09-20 para 06-22
+	// (12/08) esqueceu deste teste e ele ficou vermelho em silêncio. Assim não repete.
 	cases := []struct {
 		hour, minute int
 		allowed      bool
 	}{
-		{8, 59, false},
-		{9, 0, true},
-		{19, 59, true},
-		{20, 0, false},
+		{(whatsappSendStartHour + 23) % 24, 59, false},
+		{whatsappSendStartHour, 0, true},
+		{(whatsappSendEndHour - 1) % 24, 59, true},
+		{whatsappSendEndHour % 24, 0, false}, // fim é exclusivo (24 => 00:00 é madrugada)
 	}
 	for _, tc := range cases {
 		when := time.Date(2026, 8, 5, tc.hour, tc.minute, 0, 0, local)
@@ -240,8 +243,9 @@ func TestWhatsAppSendSafeHours(t *testing.T) {
 			t.Errorf("%02d:%02d allowed=%v, want %v", tc.hour, tc.minute, got, tc.allowed)
 		}
 	}
-	if got := whatsappQuietHoursMessage(); got !=
-		"envio de WhatsApp bloqueado fora do horário seguro (09:00–19:59, horário local)" {
-		t.Fatalf("mensagem inesperada: %q", got)
+	want := fmt.Sprintf("envio de WhatsApp bloqueado fora do horário seguro (%02d:00–%02d:59, horário local)",
+		whatsappSendStartHour, whatsappSendEndHour-1)
+	if got := whatsappQuietHoursMessage(); got != want {
+		t.Fatalf("mensagem inesperada: %q (queria %q)", got, want)
 	}
 }

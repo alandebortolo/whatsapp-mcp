@@ -39,8 +39,11 @@ import (
 const (
 	defaultStoreDir       = "store"
 	defaultBridgePort     = 8080
-	whatsappSendStartHour = 6
-	whatsappSendEndHour   = 22
+	// Janela de envio automático (decisão do Alan, 14/08/2026: era 06-22 e travava demais).
+	// Os mesmos números vivem no Clauditor (core.SEND_START_HOUR/SEND_END_HOUR) e na regra
+	// dura do ~/.claude/CLAUDE.md — mudar aqui pede mudar lá. Fim é EXCLUSIVO: 24 = 23:59.
+	whatsappSendStartHour = 5
+	whatsappSendEndHour   = 24
 )
 
 func whatsappSendAllowedAt(now time.Time) bool {
