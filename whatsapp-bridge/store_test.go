@@ -10,6 +10,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // db temporário com o MESMO schema/pragma do NewMessageStore (FK ligada — é ela que
@@ -26,6 +28,7 @@ func testStore(t *testing.T) *MessageStore {
 			id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
 			is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB,
 			file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER,
+			quoted_id TEXT, quoted_sender TEXT, quoted_text TEXT,
 			PRIMARY KEY (id, chat_jid), FOREIGN KEY (chat_jid) REFERENCES chats(jid));`); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +174,7 @@ func TestTouchChatCreatesNewAndAllowsMessage(t *testing.T) {
 
 	// só passa se a linha de chats existe — é a FK que o caminho de envio precisa honrar
 	if err := s.StoreMessage("MSGID1", jid, "5527998372363", "oi", now, true,
-		"", "", "", nil, nil, nil, 0); err != nil {
+		"", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("FK barrou a mensagem mesmo após TouchChat: %v", err)
 	}
 }
@@ -186,13 +189,13 @@ func TestStoreMessageKeepsFirstTimestamp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.StoreMessage("MSGID3", jid, jid, "agradece seu contato", primeira, false,
-		"", "", "", nil, nil, nil, 0); err != nil {
+		"", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
 	// mesma mensagem chegando de novo, agora com a hora da reentrega e a legenda completa
 	if err := s.StoreMessage("MSGID3", jid, jid, "agradece seu contato, como podemos ajudar?",
-		primeira.Add(time.Hour), false, "", "", "", nil, nil, nil, 0); err != nil {
+		primeira.Add(time.Hour), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -215,11 +218,35 @@ func TestStoreMessageKeepsFirstTimestamp(t *testing.T) {
 	}
 }
 
+// Citação: o que a pessoa respondeu tem que sobreviver ao store, senão o leitor recebe
+// "concordo" sem saber com o quê. A reentrega não pode apagar a citação já gravada.
+func TestStoreMessageKeepsQuoted(t *testing.T) {
+	s := testStore(t)
+	jid := "120363000000000000@g.us"
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.TouchChat(jid, "Grupo", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("MSGQ1", jid, "5527999999999", "concordo", now, false,
+		"", "", "", nil, nil, nil, 0, "MSGORIG", "5527998888888", "vamos subir sexta?"); err != nil {
+		t.Fatal(err)
+	}
+	var qid, qsender, qtext string
+	if err := s.db.QueryRow(
+		"SELECT quoted_id, quoted_sender, quoted_text FROM messages WHERE id = 'MSGQ1'").
+		Scan(&qid, &qsender, &qtext); err != nil {
+		t.Fatal(err)
+	}
+	if qid != "MSGORIG" || qsender != "5527998888888" || qtext != "vamos subir sexta?" {
+		t.Errorf("citação não sobreviveu: %q / %q / %q", qid, qsender, qtext)
+	}
+}
+
 // Sem o TouchChat antes, a FK rejeita — a regressão que o comentário no envio previne.
 func TestStoreMessageNeedsChatRow(t *testing.T) {
 	s := testStore(t)
 	if err := s.StoreMessage("MSGID2", "5511888888888@s.whatsapp.net", "eu", "oi",
-		time.Now(), true, "", "", "", nil, nil, nil, 0); err == nil {
+		time.Now(), true, "", "", "", nil, nil, nil, 0, "", "", ""); err == nil {
 		t.Error("esperava erro de FK para chat inexistente")
 	}
 }
@@ -247,5 +274,52 @@ func TestWhatsAppSendSafeHours(t *testing.T) {
 		whatsappSendStartHour, whatsappSendEndHour-1)
 	if got := whatsappQuietHoursMessage(); got != want {
 		t.Fatalf("mensagem inesperada: %q (queria %q)", got, want)
+	}
+}
+
+// O ContextInfo não mora num campo só: cada tipo de mensagem carrega o seu. Este teste
+// é a garantia de que texto E mídia com citação são reconhecidos, e de que ContextInfo
+// sem stanza id (menção, encaminhamento) NÃO vira citação inventada.
+func TestQuotedContextInfo(t *testing.T) {
+	quoted := &waProto.Message{Conversation: proto.String("vamos subir sexta?")}
+	ctx := func() *waProto.ContextInfo {
+		return &waProto.ContextInfo{
+			StanzaID:      proto.String("ORIG1"),
+			Participant:   proto.String("5527998888888@s.whatsapp.net"),
+			QuotedMessage: quoted,
+		}
+	}
+	cases := map[string]*waProto.Message{
+		"texto": {ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String("concordo"), ContextInfo: ctx()}},
+		"imagem": {ImageMessage: &waProto.ImageMessage{
+			Caption: proto.String("essa aqui"), ContextInfo: ctx()}},
+		"audio": {AudioMessage: &waProto.AudioMessage{ContextInfo: ctx()}},
+		"documento": {DocumentMessage: &waProto.DocumentMessage{ContextInfo: ctx()}},
+	}
+	for kind, msg := range cases {
+		ci := quotedContextInfo(msg)
+		if ci == nil {
+			t.Fatalf("%s: citação não reconhecida", kind)
+		}
+		if ci.GetStanzaID() != "ORIG1" || ci.GetParticipant() != "5527998888888@s.whatsapp.net" {
+			t.Errorf("%s: id/autor errados: %q / %q", kind, ci.GetStanzaID(), ci.GetParticipant())
+		}
+		if got := extractTextContent(ci.GetQuotedMessage()); got != "vamos subir sexta?" {
+			t.Errorf("%s: texto da citada veio %q", kind, got)
+		}
+	}
+
+	semCitacao := []*waProto.Message{
+		nil,
+		{Conversation: proto.String("oi")},
+		{ExtendedTextMessage: &waProto.ExtendedTextMessage{ // menção: ContextInfo sem stanza id
+			Text: proto.String("@5527 bom dia"), ContextInfo: &waProto.ContextInfo{
+				MentionedJID: []string{"5527998888888@s.whatsapp.net"}}}},
+	}
+	for i, msg := range semCitacao {
+		if ci := quotedContextInfo(msg); ci != nil {
+			t.Errorf("caso %d: inventou citação (stanza %q)", i, ci.GetStanzaID())
+		}
 	}
 }

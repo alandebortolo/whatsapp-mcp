@@ -175,6 +175,9 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_id TEXT,
+			quoted_sender TEXT,
+			quoted_text TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -182,6 +185,13 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Banco que já existe não ganha coluna pelo CREATE IF NOT EXISTS acima: as três
+	// colunas de citação nasceram depois dos stores em produção. ponytail: ALTER que
+	// já rodou devolve "duplicate column name" — erro esperado, não é falha de migração.
+	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT"} {
+		db.Exec("ALTER TABLE messages ADD COLUMN " + col)
 	}
 
 	return &MessageStore{db: db, storeDir: storeDir}, nil
@@ -215,7 +225,8 @@ func (store *MessageStore) TouchChat(jid, fallbackName string, lastMessageTime t
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedID, quotedSender, quotedText string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -230,14 +241,17 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	// nosso lado nunca manda recibo.
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_id, quoted_sender, quoted_text)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender, content = excluded.content, is_from_me = excluded.is_from_me,
 			media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
 			media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
-			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length`,
+			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length,
+			quoted_id = excluded.quoted_id, quoted_sender = excluded.quoted_sender,
+			quoted_text = excluded.quoted_text`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		quotedID, quotedSender, quotedText,
 	)
 	return err
 }
@@ -313,6 +327,49 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 
 	return ""
+}
+
+// Responder citando ("reply") não é mensagem comum: quem é citado vive no ContextInfo,
+// que o whatsmeow pendura em CADA tipo de mensagem em vez de num campo só. Sem isto o
+// leitor recebe "concordo" solto e não sabe com o quê — em grupo, com três conversas
+// entrelaçadas, isso é o texto inteiro perdendo o sentido. Guardamos o id da citada
+// (casa com messages.id), quem a escreveu e um retrato do texto dela: o retrato cobre
+// citação de mensagem que nunca entrou no nosso store (anterior à ponte, ou apagada).
+func quotedContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+	var ci *waProto.ContextInfo
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		ci = msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		ci = msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		ci = msg.GetVideoMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		ci = msg.GetAudioMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		ci = msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetStickerMessage() != nil:
+		ci = msg.GetStickerMessage().GetContextInfo()
+	}
+	if ci.GetStanzaID() == "" {
+		return nil // ContextInfo sem stanza id é menção/encaminhamento, não citação
+	}
+	return ci
+}
+
+func extractQuoted(client *whatsmeow.Client, msg *waProto.Message) (id, sender, text string) {
+	ci := quotedContextInfo(msg)
+	if ci == nil {
+		return "", "", ""
+	}
+	sender = ci.GetParticipant()
+	if jid, err := types.ParseJID(sender); err == nil {
+		sender = resolveJID(client, jid).User // mesmo formato de messages.sender
+	}
+	return ci.GetStanzaID(), sender, extractTextContent(ci.GetQuotedMessage())
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -522,9 +579,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	quotedID, quotedSender, quotedText := extractQuoted(client, msg)
 	if err := messageStore.StoreMessage(resp.ID, chatJID, client.Store.ID.User,
 		extractTextContent(msg), resp.Timestamp, true,
-		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		quotedID, quotedSender, quotedText); err != nil {
 		// enviada de verdade — não falha a request, mas avisa que a cópia local faltou
 		fmt.Printf("Warning: message sent but not stored locally: %v\n", err)
 	}
@@ -700,6 +759,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	quotedID, quotedSender, quotedText := extractQuoted(client, msg.Message)
+
 	// Store message in database
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
@@ -715,6 +776,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
+		quotedSender,
+		quotedText,
 	)
 
 	if err != nil {
@@ -1493,6 +1557,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				quotedID, quotedSender, quotedText := extractQuoted(client, msg.Message.Message)
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -1507,6 +1573,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedSender,
+					quotedText,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
