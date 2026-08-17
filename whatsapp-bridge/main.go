@@ -37,8 +37,8 @@ import (
 )
 
 const (
-	defaultStoreDir       = "store"
-	defaultBridgePort     = 8080
+	defaultStoreDir   = "store"
+	defaultBridgePort = 8080
 	// Janela de envio automático (decisão do Alan, 14/08/2026: era 06-22 e travava demais).
 	// Os mesmos números vivem no Clauditor (core.SEND_START_HOUR/SEND_END_HOUR) e na regra
 	// dura do ~/.claude/CLAUDE.md — mudar aqui pede mudar lá. Fim é EXCLUSIVO: 24 = 23:59.
@@ -309,6 +309,7 @@ func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
+	msg = unwrapMessage(msg)
 
 	// Try to get text content
 	if text := msg.GetConversation(); text != "" {
@@ -326,6 +327,234 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	return interactiveText(msg)
+}
+
+// Efêmera, ver-uma-vez e editada não são um tipo de mensagem: são um envelope em volta
+// da mensagem de verdade. O whatsmeow desembrulha o que chega ao vivo, mas o que vem do
+// history sync e a mensagem CITADA chegam embrulhadas — e olhar só a casca dá texto vazio.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	for i := 0; i < 4 && msg != nil; i++ { // teto: envelope dentro de envelope não passa disso
+		switch {
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		case msg.GetEditedMessage().GetMessage() != nil:
+			msg = msg.GetEditedMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
+}
+
+// Menu de bot de atendimento (Asaas, Cloud API da Meta e afins) não tem texto em
+// Conversation: o corpo mora num campo próprio e as opções em outro. Sem isto a
+// mensagem inteira chegava vazia e o handler a DESCARTAVA — a conversa virava um
+// monólogo com buracos, e o agente, que nunca viu o menu, respondia texto livre e
+// levava "Opção inválida" de volta. Vale para os dois lados: a escolha de quem
+// clica no botão também é uma mensagem sem Conversation.
+//
+// Formato: corpo em cima, opções numa linha "[menu] a | b | c" — legível pra pessoa
+// no dashboard e pro agente que precisa escolher uma delas.
+func interactiveText(msg *waProto.Message) string {
+	var body, opts []string
+	addBody := func(parts ...string) {
+		for _, s := range parts {
+			if s = strings.TrimSpace(s); s != "" {
+				body = append(body, s)
+			}
+		}
+	}
+	addOpt := func(title, desc string) {
+		title, desc = strings.TrimSpace(title), strings.TrimSpace(desc)
+		if title == "" {
+			title = desc
+			desc = ""
+		}
+		if title == "" {
+			return
+		}
+		if desc != "" {
+			title += " (" + desc + ")"
+		}
+		opts = append(opts, title)
+	}
+
+	switch {
+	// --- menus ---
+	case msg.GetButtonsMessage() != nil:
+		b := msg.GetButtonsMessage()
+		addBody(b.GetText(), b.GetContentText(), b.GetFooterText())
+		for _, btn := range b.GetButtons() {
+			addOpt(btn.GetButtonText().GetDisplayText(), "")
+		}
+	case msg.GetListMessage() != nil:
+		l := msg.GetListMessage()
+		addBody(l.GetTitle(), l.GetDescription(), l.GetFooterText())
+		for _, sec := range l.GetSections() {
+			for _, row := range sec.GetRows() {
+				addOpt(row.GetTitle(), row.GetDescription())
+			}
+		}
+	case msg.GetInteractiveMessage() != nil:
+		b, o := interactiveParts(msg.GetInteractiveMessage())
+		addBody(b...)
+		opts = append(opts, o...)
+	case msg.GetTemplateMessage() != nil:
+		t := msg.GetTemplateMessage()
+		if inner := t.GetInteractiveMessageTemplate(); inner != nil {
+			b, o := interactiveParts(inner)
+			addBody(b...)
+			opts = append(opts, o...)
+		}
+		if h := t.GetHydratedTemplate(); h != nil {
+			addBody(h.GetHydratedTitleText(), h.GetHydratedContentText(), h.GetHydratedFooterText())
+			for _, btn := range h.GetHydratedButtons() {
+				switch {
+				case btn.GetQuickReplyButton() != nil:
+					addOpt(btn.GetQuickReplyButton().GetDisplayText(), "")
+				case btn.GetUrlButton() != nil:
+					addOpt(btn.GetUrlButton().GetDisplayText(), btn.GetUrlButton().GetURL())
+				case btn.GetCallButton() != nil:
+					addOpt(btn.GetCallButton().GetDisplayText(), btn.GetCallButton().GetPhoneNumber())
+				}
+			}
+		}
+	// Enquete some pelo mesmo motivo (texto fora de Conversation); as versões V2/V3
+	// são o mesmo payload em campos diferentes, por migração do protocolo.
+	case msg.GetPollCreationMessage() != nil || msg.GetPollCreationMessageV2() != nil || msg.GetPollCreationMessageV3() != nil:
+		p := msg.GetPollCreationMessage()
+		if p == nil {
+			p = msg.GetPollCreationMessageV2()
+		}
+		if p == nil {
+			p = msg.GetPollCreationMessageV3()
+		}
+		addBody(p.GetName())
+		for _, opt := range p.GetOptions() {
+			addOpt(opt.GetOptionName(), "")
+		}
+
+	// --- respostas (o que a pessoa escolheu; o texto É a resposta, sem "[menu]") ---
+	case msg.GetButtonsResponseMessage() != nil:
+		r := msg.GetButtonsResponseMessage()
+		return firstNonEmpty(r.GetSelectedDisplayText(), r.GetSelectedButtonID())
+	case msg.GetListResponseMessage() != nil:
+		r := msg.GetListResponseMessage()
+		return firstNonEmpty(r.GetTitle(), r.GetDescription(), r.GetSingleSelectReply().GetSelectedRowID())
+	case msg.GetTemplateButtonReplyMessage() != nil:
+		r := msg.GetTemplateButtonReplyMessage()
+		return firstNonEmpty(r.GetSelectedDisplayText(), r.GetSelectedID())
+	case msg.GetInteractiveResponseMessage() != nil:
+		r := msg.GetInteractiveResponseMessage()
+		if t := strings.TrimSpace(r.GetBody().GetText()); t != "" {
+			return t
+		}
+		p := parseFlowParams(r.GetNativeFlowResponseMessage().GetParamsJSON())
+		return firstNonEmpty(p.DisplayText, p.Title, p.ID)
+	}
+
+	if len(opts) > 0 {
+		body = append(body, "[menu] "+strings.Join(opts, " | "))
+	}
+	return strings.Join(body, "\n")
+}
+
+// InteractiveMessage é o menu da Cloud API: corpo em campos próprios e as opções
+// escondidas num JSON por botão (native flow), cuja forma muda com o tipo do botão.
+func interactiveParts(m *waProto.InteractiveMessage) (body, opts []string) {
+	body = append(body, m.GetHeader().GetTitle(), m.GetHeader().GetSubtitle(), m.GetBody().GetText(), m.GetFooter().GetText())
+	for _, btn := range m.GetNativeFlowMessage().GetButtons() {
+		p := parseFlowParams(btn.GetButtonParamsJSON())
+		if len(p.Sections) > 0 { // single_select: as opções vivem nas linhas das seções
+			for _, sec := range p.Sections {
+				for _, row := range sec.Rows {
+					opts = append(opts, strings.TrimSpace(firstNonEmpty(row.Title, row.Description, row.ID)))
+				}
+			}
+			continue
+		}
+		if t := strings.TrimSpace(firstNonEmpty(p.DisplayText, p.Title, btn.GetName())); t != "" {
+			if p.URL != "" {
+				t += " (" + p.URL + ")"
+			}
+			opts = append(opts, t)
+		}
+	}
+	// Carrossel: cada card é um InteractiveMessage inteiro. Sem isto o card fica vazio.
+	for _, card := range m.GetCarouselMessage().GetCards() {
+		b, o := interactiveParts(card)
+		body = append(body, b...)
+		opts = append(opts, o...)
+	}
+	return body, opts
+}
+
+// Parâmetros do botão native flow. Um só struct para todos os tipos (quick_reply,
+// cta_url, single_select…): campo que não existe naquele tipo fica vazio.
+type flowParams struct {
+	DisplayText string `json:"display_text"`
+	Title       string `json:"title"`
+	URL         string `json:"url"`
+	ID          string `json:"id"`
+	Sections    []struct {
+		Title string `json:"title"`
+		Rows  []struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			ID          string `json:"id"`
+		} `json:"rows"`
+	} `json:"sections"`
+}
+
+func parseFlowParams(raw string) flowParams {
+	var p flowParams
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &p) // JSON quebrado vira menu sem opção, não erro
+	}
+	return p
+}
+
+// Tipos que legitimamente não têm texto: não valem uma linha de log (o bridge.log já
+// passa de 80 MB e o launchd não rotaciona nada). Qualquer outro tipo descartado é
+// candidato a buraco na conversa, como foram os menus, e por isso vira warn.
+var silentDrop = map[string]bool{
+	"ProtocolMessage": true, "ReactionMessage": true, "PollUpdateMessage": true,
+	"SenderKeyDistributionMessage": true, "StickerSyncRmrMessage": true,
+	"KeepInChatMessage": true, "EncReactionMessage": true, "PinInChatMessage": true,
+	"EventResponseMessage": true, "StickerMessage": true, "Call": true,
+}
+
+// Nome do campo preenchido dentro de Message — só para o log dizer o que foi descartado.
+func messageTypeName(msg *waProto.Message) string {
+	if msg == nil {
+		return "nil"
+	}
+	v := reflect.ValueOf(msg).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if !f.IsExported() || f.Name == "MessageContextInfo" {
+			continue
+		}
+		if fv := v.Field(i); fv.Kind() == reflect.Ptr && !fv.IsNil() {
+			return f.Name
+		}
+	}
+	return "desconhecido"
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
 	return ""
 }
 
@@ -339,6 +568,7 @@ func quotedContextInfo(msg *waProto.Message) *waProto.ContextInfo {
 	if msg == nil {
 		return nil
 	}
+	msg = unwrapMessage(msg)
 	var ci *waProto.ContextInfo
 	switch {
 	case msg.GetExtendedTextMessage() != nil:
@@ -353,6 +583,24 @@ func quotedContextInfo(msg *waProto.Message) *waProto.ContextInfo {
 		ci = msg.GetDocumentMessage().GetContextInfo()
 	case msg.GetStickerMessage() != nil:
 		ci = msg.GetStickerMessage().GetContextInfo()
+	// Resposta de menu é sempre uma citação da mensagem do menu — é isso que o
+	// WhatsApp desenha em cima do "Já sou cliente" que a pessoa clicou.
+	case msg.GetButtonsResponseMessage() != nil:
+		ci = msg.GetButtonsResponseMessage().GetContextInfo()
+	case msg.GetListResponseMessage() != nil:
+		ci = msg.GetListResponseMessage().GetContextInfo()
+	case msg.GetTemplateButtonReplyMessage() != nil:
+		ci = msg.GetTemplateButtonReplyMessage().GetContextInfo()
+	case msg.GetInteractiveResponseMessage() != nil:
+		ci = msg.GetInteractiveResponseMessage().GetContextInfo()
+	case msg.GetButtonsMessage() != nil:
+		ci = msg.GetButtonsMessage().GetContextInfo()
+	case msg.GetListMessage() != nil:
+		ci = msg.GetListMessage().GetContextInfo()
+	case msg.GetInteractiveMessage() != nil:
+		ci = msg.GetInteractiveMessage().GetContextInfo()
+	case msg.GetTemplateMessage() != nil:
+		ci = msg.GetTemplateMessage().GetContextInfo()
 	}
 	if ci.GetStanzaID() == "" {
 		return nil // ContextInfo sem stanza id é menção/encaminhamento, não citação
@@ -756,6 +1004,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
+		// Descartar calado foi o que escondeu os menus por meses: a conversa ficava com
+		// buracos e ninguém sabia que faltava algo. O tipo no log diz qual formato ainda
+		// não sabemos ler (protocolMessage/reaction/poll update são esperados aqui).
+		if t := messageTypeName(msg.Message); !silentDrop[t] {
+			logger.Warnf("mensagem sem texto e sem midia, descartada: %s (%s)", t, msg.Info.ID)
+		}
 		return
 	}
 
@@ -1495,14 +1749,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
