@@ -194,6 +194,24 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Exec("ALTER TABLE messages ADD COLUMN " + col)
 	}
 
+	// Reação não é mensagem: uma por pessoa por alvo (o WhatsApp só deixa uma). Emoji
+	// vazio = a pessoa tirou a reação. Sem FK pra messages: a alvo pode não estar no
+	// store (anterior à ponte, ou history sync ainda não trouxe).
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS reactions (
+			chat_jid TEXT NOT NULL,
+			message_id TEXT NOT NULL,
+			sender TEXT NOT NULL,
+			emoji TEXT NOT NULL,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (chat_jid, message_id, sender)
+		);
+	`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create reactions table: %v", err)
+	}
+
 	return &MessageStore{db: db, storeDir: storeDir}, nil
 }
 
@@ -254,6 +272,37 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		quotedID, quotedSender, quotedText,
 	)
 	return err
+}
+
+// StoreReaction grava ou apaga a reação de UMA pessoa numa mensagem. Emoji vazio
+// (o que o WhatsApp manda quando a pessoa tira) apaga a linha. Uma pessoa só tem
+// uma reação por alvo: o UPSERT substitui o emoji anterior.
+func (store *MessageStore) StoreReaction(chatJID, messageID, sender, emoji string, ts time.Time, fromMe bool) error {
+	if messageID == "" || sender == "" {
+		return nil
+	}
+	if strings.TrimSpace(emoji) == "" {
+		_, err := store.db.Exec(
+			`DELETE FROM reactions WHERE chat_jid = ? AND message_id = ? AND sender = ?`,
+			chatJID, messageID, sender)
+		return err
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO reactions (chat_jid, message_id, sender, emoji, timestamp, is_from_me)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(chat_jid, message_id, sender) DO UPDATE SET
+			emoji = excluded.emoji, timestamp = excluded.timestamp, is_from_me = excluded.is_from_me`,
+		chatJID, messageID, sender, emoji, ts, fromMe)
+	return err
+}
+
+// GetMessageMeta devolve de quem é a mensagem alvo (pra montar o MessageKey da reação).
+func (store *MessageStore) GetMessageMeta(id, chatJID string) (fromMe bool, sender string, ok bool) {
+	err := store.db.QueryRow(
+		`SELECT is_from_me, IFNULL(sender, '') FROM messages WHERE id = ? AND chat_jid = ?`,
+		id, chatJID,
+	).Scan(&fromMe, &sender)
+	return fromMe, sender, err == nil
 }
 
 // Get messages from a chat
@@ -525,10 +574,96 @@ func parseFlowParams(raw string) flowParams {
 // passa de 80 MB e o launchd não rotaciona nada). Qualquer outro tipo descartado é
 // candidato a buraco na conversa, como foram os menus, e por isso vira warn.
 var silentDrop = map[string]bool{
-	"ProtocolMessage": true, "ReactionMessage": true, "PollUpdateMessage": true,
+	"ProtocolMessage": true, "PollUpdateMessage": true,
 	"SenderKeyDistributionMessage": true, "StickerSyncRmrMessage": true,
-	"KeepInChatMessage": true, "EncReactionMessage": true, "PinInChatMessage": true,
+	"KeepInChatMessage": true, "PinInChatMessage": true,
 	"EventResponseMessage": true, "StickerMessage": true, "Call": true,
+}
+
+// incomingReaction lê ReactionMessage (1:1 e grupo comum) ou EncReactionMessage
+// (comunidade). ok=false: não era reação, ou a criptografada não abriu.
+func incomingReaction(client *whatsmeow.Client, ev *events.Message) (targetID, emoji string, ok bool) {
+	if ev == nil || ev.Message == nil {
+		return "", "", false
+	}
+	if r := ev.Message.GetReactionMessage(); r != nil {
+		if key := r.GetKey(); key != nil && key.GetID() != "" {
+			return key.GetID(), r.GetText(), true
+		}
+		return "", "", false
+	}
+	if ev.Message.GetEncReactionMessage() == nil || client == nil {
+		return "", "", false
+	}
+	dec, err := client.DecryptReaction(context.Background(), ev)
+	if err != nil || dec == nil {
+		return "", "", false
+	}
+	if key := dec.GetKey(); key != nil && key.GetID() != "" {
+		return key.GetID(), dec.GetText(), true
+	}
+	return "", "", false
+}
+
+// protoReaction é o caminho do history sync: só o proto, sem events.Message —
+// EncReaction fica de fora (DecryptReaction precisa do envelope do evento).
+func protoReaction(msg *waProto.Message) (targetID, emoji string, ok bool) {
+	if msg == nil {
+		return "", "", false
+	}
+	msg = unwrapMessage(msg)
+	r := msg.GetReactionMessage()
+	if r == nil {
+		return "", "", false
+	}
+	key := r.GetKey()
+	if key == nil || key.GetID() == "" {
+		return "", "", false
+	}
+	return key.GetID(), r.GetText(), true
+}
+
+func validReactionEmoji(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true // vazio = tirar a reação
+	}
+	if strings.ContainsAny(s, "\n\r\t") {
+		return false
+	}
+	n := 0
+	for range s {
+		n++
+		if n > 8 {
+			return false
+		}
+	}
+	return n > 0
+}
+
+func parseRecipientJID(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{User: recipient, Server: "s.whatsapp.net"}, nil
+}
+
+func targetSenderJID(chat types.JID, fromMe bool, sender string) types.JID {
+	if fromMe {
+		return types.EmptyJID
+	}
+	if chat.Server != types.GroupServer {
+		return chat
+	}
+	if strings.Contains(sender, "@") {
+		if j, err := types.ParseJID(sender); err == nil {
+			return j
+		}
+	}
+	if sender == "" {
+		return types.EmptyJID
+	}
+	return types.NewJID(sender, types.DefaultUserServer)
 }
 
 // Nome do campo preenchido dentro de Message — só para o log dizer o que foi descartado.
@@ -839,6 +974,45 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// sendWhatsAppReaction manda uma reação (emoji vazio = tira). Fora da janela de
+// horário: reação não é recado, é um toque — o celular também deixa de madrugada.
+func sendWhatsAppReaction(client *whatsmeow.Client, messageStore *MessageStore, recipient, messageID, emoji string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if strings.TrimSpace(messageID) == "" {
+		return false, "message_id is required"
+	}
+	if !validReactionEmoji(emoji) {
+		return false, "reação inválida"
+	}
+	chat, err := parseRecipientJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+	fromMe, sender, ok := messageStore.GetMessageMeta(messageID, chat.String())
+	if !ok {
+		return false, "mensagem alvo não está no histórico local"
+	}
+	senderJID := targetSenderJID(chat, fromMe, sender)
+	msg := client.BuildReaction(chat, senderJID, types.MessageID(messageID), strings.TrimSpace(emoji))
+	resp, err := client.SendMessage(context.Background(), chat, msg)
+	if err != nil {
+		return false, fmt.Sprintf("Error sending reaction: %v", err)
+	}
+	ourUser := ""
+	if client.Store.ID != nil {
+		ourUser = client.Store.ID.User
+	}
+	if ourUser == "" {
+		ourUser = "me"
+	}
+	if err := messageStore.StoreReaction(chat.String(), messageID, ourUser, strings.TrimSpace(emoji), resp.Timestamp, true); err != nil {
+		fmt.Printf("Warning: reaction sent but not stored locally: %v\n", err)
+	}
+	return true, "ok"
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -986,6 +1160,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chat := resolveJID(client, msg.Info.Chat)
 	chatJID := chat.String()
 	sender := resolveJID(client, msg.Info.Sender).User
+
+	// Reação não é mensagem: grava na tabela própria e sai sem tocar last_message_time
+	// (a prévia da caixa continua sendo a última mensagem de verdade). EncReaction
+	// que não abriu também sai aqui — senão o StoreChat abaixo bumpava o chat à toa.
+	if targetID, emoji, ok := incomingReaction(client, msg); ok {
+		if err := messageStore.StoreReaction(chatJID, targetID, sender, emoji, msg.Info.Timestamp, msg.Info.IsFromMe); err != nil {
+			logger.Warnf("Failed to store reaction: %v", err)
+		}
+		return
+	}
+	if msg.Message != nil && (msg.Message.GetReactionMessage() != nil || msg.Message.GetEncReactionMessage() != nil) {
+		return
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
@@ -1330,6 +1517,32 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			Success: success,
 			Message: message,
 		})
+	})
+
+	mux.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient"`
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.MessageID == "" {
+			http.Error(w, "Recipient and message_id are required", http.StatusBadRequest)
+			return
+		}
+		success, message := sendWhatsAppReaction(client, messageStore, req.Recipient, req.MessageID, req.Emoji)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 	})
 
 	// Handler for downloading media
@@ -1763,11 +1976,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
-				// Skip messages with no content and no media
-				if content == "" && mediaType == "" {
-					continue
-				}
-
 				// Determine sender
 				var sender string
 				isFromMe := false
@@ -1801,6 +2009,19 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
 					timestamp = time.Unix(int64(ts), 0)
 				} else {
+					continue
+				}
+
+				// Reação no history sync: não é mensagem, não entra no store de texto.
+				if content == "" && mediaType == "" {
+					if targetID, emoji, ok := protoReaction(msg.Message.Message); ok {
+						if sender == "" {
+							sender = jid.User
+						}
+						if err := messageStore.StoreReaction(chatJID, targetID, sender, emoji, timestamp, isFromMe); err != nil {
+							logger.Warnf("Failed to store history reaction: %v", err)
+						}
+					}
 					continue
 				}
 

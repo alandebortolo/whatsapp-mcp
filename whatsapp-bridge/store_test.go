@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -248,6 +249,90 @@ func TestStoreMessageNeedsChatRow(t *testing.T) {
 	if err := s.StoreMessage("MSGID2", "5511888888888@s.whatsapp.net", "eu", "oi",
 		time.Now(), true, "", "", "", nil, nil, nil, 0, "", "", ""); err == nil {
 		t.Error("esperava erro de FK para chat inexistente")
+	}
+}
+
+func TestStoreReactionUpsertAndClear(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewMessageStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	jid, mid, who := "5511999999999@s.whatsapp.net", "MSG1", "5511888888888"
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.StoreReaction(jid, mid, who, "👍", now, false); err != nil {
+		t.Fatal(err)
+	}
+	var emoji string
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT emoji, (SELECT COUNT(*) FROM reactions) FROM reactions WHERE message_id = ?`, mid).
+		Scan(&emoji, &n); err != nil {
+		t.Fatal(err)
+	}
+	if emoji != "👍" || n != 1 {
+		t.Fatalf("primeira reação: emoji=%q n=%d", emoji, n)
+	}
+	if err := s.StoreReaction(jid, mid, who, "❤️", now.Add(time.Second), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(
+		`SELECT emoji, (SELECT COUNT(*) FROM reactions) FROM reactions WHERE message_id = ?`, mid).
+		Scan(&emoji, &n); err != nil {
+		t.Fatal(err)
+	}
+	if emoji != "❤️" || n != 1 {
+		t.Fatalf("troca de emoji tinha de atualizar a linha: emoji=%q n=%d", emoji, n)
+	}
+	if err := s.StoreReaction(jid, mid, who, "", now.Add(2*time.Second), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM reactions`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("emoji vazio tinha de apagar a reação: %d linhas", n)
+	}
+}
+
+func TestIncomingReactionPlain(t *testing.T) {
+	ev := &struct {
+		Message *waProto.Message
+	}{Message: &waProto.Message{
+		ReactionMessage: &waProto.ReactionMessage{
+			Key:  &waProto.MessageKey{ID: proto.String("ALVO")},
+			Text: proto.String("😂"),
+		},
+	}}
+	// incomingReaction precisa de *events.Message; o proto é o que importa aqui.
+	target, emoji, ok := protoReaction(ev.Message)
+	if !ok || target != "ALVO" || emoji != "😂" {
+		t.Fatalf("protoReaction: ok=%v target=%q emoji=%q", ok, target, emoji)
+	}
+	if _, _, ok := protoReaction(&waProto.Message{}); ok {
+		t.Fatal("mensagem sem reação não pode parecer reação")
+	}
+	if !validReactionEmoji("") || !validReactionEmoji("👍") || validReactionEmoji("x\ny") || !validReactionEmoji("❤️") {
+		t.Fatal("validReactionEmoji recusou o que era pra aceitar (ou aceitou lixo)")
+	}
+	if validReactionEmoji("123456789") {
+		t.Fatal("reação longa demais passou")
+	}
+}
+
+func TestTargetSenderJID(t *testing.T) {
+	dm := types.NewJID("5511999", types.DefaultUserServer)
+	if got := targetSenderJID(dm, true, "x"); !got.IsEmpty() {
+		t.Fatalf("própria mensagem 1:1: queria EmptyJID, veio %s", got)
+	}
+	if got := targetSenderJID(dm, false, "x"); got != dm {
+		t.Fatalf("mensagem deles 1:1: queria o chat, veio %s", got)
+	}
+	grp := types.NewJID("120363", types.GroupServer)
+	got := targetSenderJID(grp, false, "5511888")
+	if got.User != "5511888" || got.Server != types.DefaultUserServer {
+		t.Fatalf("participante de grupo: %s", got)
 	}
 }
 
