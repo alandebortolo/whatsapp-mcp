@@ -190,7 +190,9 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// Banco que já existe não ganha coluna pelo CREATE IF NOT EXISTS acima: as três
 	// colunas de citação nasceram depois dos stores em produção. ponytail: ALTER que
 	// já rodou devolve "duplicate column name" — erro esperado, não é falha de migração.
-	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT"} {
+	// transcript: texto da transcrição automática do áudio (Whisper local), na PRÓPRIA linha
+	// do áudio — é daqui que o Clauditor lê em vez de rodar o whisper de novo.
+	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT", "transcript TEXT"} {
 		db.Exec("ALTER TABLE messages ADD COLUMN " + col)
 	}
 
@@ -271,6 +273,14 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 		quotedID, quotedSender, quotedText,
 	)
+	return err
+}
+
+// SetTranscript grava a transcrição do áudio na linha dele. Fica fora do UPSERT do
+// StoreMessage de propósito: reentrega da mesma mensagem não pode apagar o texto.
+func (store *MessageStore) SetTranscript(id, chatJID, text string) error {
+	_, err := store.db.Exec(
+		`UPDATE messages SET transcript = ? WHERE id = ? AND chat_jid = ?`, text, id, chatJID)
 	return err
 }
 
@@ -1065,7 +1075,7 @@ var transcribeSem = make(chan struct{}, 1)
 
 // transcribeAndReply baixa o áudio, transcreve via whisper.cpp local e
 // responde na própria conversa citando a mensagem de áudio.
-func transcribeAndReply(client *whatsmeow.Client, msg *events.Message, chat types.JID, logger waLog.Logger) {
+func transcribeAndReply(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, chat types.JID, logger waLog.Logger) {
 	// Evita rajada de replies atrasados se o bridge ficou fora do ar
 	if time.Since(msg.Info.Timestamp) > 15*time.Minute {
 		return
@@ -1116,6 +1126,11 @@ func transcribeAndReply(client *whatsmeow.Client, msg *events.Message, chat type
 	text := strings.TrimSpace(string(out))
 	if text == "" {
 		return
+	}
+	// Grava ANTES de tentar enviar: mesmo com o reply bloqueado pelo horário seguro o
+	// texto fica no store, e o Clauditor lê daqui em vez de re-transcrever.
+	if err := messageStore.SetTranscript(msg.Info.ID, chat.String(), text); err != nil {
+		logger.Warnf("transcricao: falha ao gravar no store: %v", err)
 	}
 
 	reply := &waProto.Message{
@@ -1241,7 +1256,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		// Transcrição automática: só áudio recebido em conversa 1:1
 		if autoTranscribe && mediaType == "audio" && !msg.Info.IsFromMe && chat.Server == types.DefaultUserServer {
-			go transcribeAndReply(client, msg, chat, logger)
+			go transcribeAndReply(client, messageStore, msg, chat, logger)
 		}
 	}
 }

@@ -29,7 +29,7 @@ func testStore(t *testing.T) *MessageStore {
 			id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
 			is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB,
 			file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER,
-			quoted_id TEXT, quoted_sender TEXT, quoted_text TEXT,
+			quoted_id TEXT, quoted_sender TEXT, quoted_text TEXT, transcript TEXT,
 			PRIMARY KEY (id, chat_jid), FOREIGN KEY (chat_jid) REFERENCES chats(jid));`); err != nil {
 		t.Fatal(err)
 	}
@@ -240,6 +240,35 @@ func TestStoreMessageKeepsQuoted(t *testing.T) {
 	}
 	if qid != "MSGORIG" || qsender != "5527998888888" || qtext != "vamos subir sexta?" {
 		t.Errorf("citação não sobreviveu: %q / %q / %q", qid, qsender, qtext)
+	}
+}
+
+// A transcrição fica na linha do áudio e sobrevive à reentrega da mesma mensagem
+// (o UPSERT do StoreMessage não toca a coluna).
+func TestSetTranscriptSurvivesRedelivery(t *testing.T) {
+	s := testStore(t)
+	jid := "5527999999999@s.whatsapp.net"
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.TouchChat(jid, "Marco", now); err != nil {
+		t.Fatal(err)
+	}
+	store := func() {
+		if err := s.StoreMessage("AUD1", jid, "5527999999999", "", now, false,
+			"audio", "a.ogg", "u", nil, nil, nil, 10, "", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store()
+	if err := s.SetTranscript("AUD1", jid, "oi, tudo bem?"); err != nil {
+		t.Fatal(err)
+	}
+	store() // reentrega
+	var tr sql.NullString
+	if err := s.db.QueryRow("SELECT transcript FROM messages WHERE id = 'AUD1'").Scan(&tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr.String != "oi, tudo bem?" {
+		t.Errorf("transcrição sumiu na reentrega: %q", tr.String)
 	}
 }
 
