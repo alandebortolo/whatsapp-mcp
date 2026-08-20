@@ -587,7 +587,7 @@ var silentDrop = map[string]bool{
 	"ProtocolMessage": true, "PollUpdateMessage": true,
 	"SenderKeyDistributionMessage": true, "StickerSyncRmrMessage": true,
 	"KeepInChatMessage": true, "PinInChatMessage": true,
-	"EventResponseMessage": true, "StickerMessage": true, "Call": true,
+	"EventResponseMessage": true, "Call": true,
 }
 
 // incomingReaction lê ReactionMessage (1:1 e grupo comum) ou EncReactionMessage
@@ -1047,6 +1047,13 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
+	// Figurinha: mesmo download de imagem (whatsmeow.MediaImage), arquivo .webp — o
+	// animado é webp animado, que o <img> do dashboard toca sozinho.
+	if st := msg.GetStickerMessage(); st != nil {
+		return "sticker", "sticker_" + time.Now().Format("20060102_150405") + ".webp",
+			st.GetURL(), st.GetMediaKey(), st.GetFileSHA256(), st.GetFileEncSHA256(), st.GetFileLength()
+	}
+
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
@@ -1409,7 +1416,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Create a downloader that implements DownloadableMessage
 	var waMediaType whatsmeow.MediaType
 	switch mediaType {
-	case "image":
+	case "image", "sticker":
 		waMediaType = whatsmeow.MediaImage
 	case "video":
 		waMediaType = whatsmeow.MediaVideo
