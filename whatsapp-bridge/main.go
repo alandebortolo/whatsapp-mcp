@@ -178,6 +178,7 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 			quoted_id TEXT,
 			quoted_sender TEXT,
 			quoted_text TEXT,
+			ack INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -192,7 +193,8 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// já rodou devolve "duplicate column name" — erro esperado, não é falha de migração.
 	// transcript: texto da transcrição automática do áudio (Whisper local), na PRÓPRIA linha
 	// do áudio — é daqui que o Clauditor lê em vez de rodar o whisper de novo.
-	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT", "transcript TEXT"} {
+	// ack: recibo de entrega/leitura das NOSSAS mensagens (1=servidor, 2=entregue, 3=lida).
+	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT", "transcript TEXT", "ack INTEGER"} {
 		db.Exec("ALTER TABLE messages ADD COLUMN " + col)
 	}
 
@@ -257,12 +259,16 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	// ele pulava para a hora da reentrega, e isso quebrava dois leitores: a mensagem antiga
 	// subia para o topo da conversa e o Clauditor desmarcava "lida" (a marca dele é o maior
 	// timestamp já visto no chat, então um timestamp que anda deixa a conversa não lida para
-	// sempre). Quem reentrega é o remetente insistindo em mensagem sem recibo de leitura —
-	// nosso lado nunca manda recibo.
+	// sempre). Quem reentrega é o remetente insistindo em mensagem sem recibo de leitura.
+	// ack não entra no UPSERT: um recibo já gravado (entregue/lida) não volta pra "enviada".
+	ack := 0
+	if isFromMe {
+		ack = 1 // chegou no servidor (SendMessage ok, ou veio do celular via events.Message)
+	}
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_id, quoted_sender, quoted_text)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_id, quoted_sender, quoted_text, ack)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender, content = excluded.content, is_from_me = excluded.is_from_me,
 			media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
@@ -271,9 +277,35 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			quoted_id = excluded.quoted_id, quoted_sender = excluded.quoted_sender,
 			quoted_text = excluded.quoted_text`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-		quotedID, quotedSender, quotedText,
+		quotedID, quotedSender, quotedText, ack,
 	)
 	return err
+}
+
+// SetAck sobe o recibo da mensagem (1=enviada, 2=entregue, 3=lida). Nunca desce:
+// entregue depois de lida é ruído, e a reentrega do StoreMessage não pode apagar.
+func (store *MessageStore) SetAck(id, chatJID string, ack int) error {
+	if id == "" || chatJID == "" || ack < 1 || ack > 3 {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`UPDATE messages SET ack = ? WHERE id = ? AND chat_jid = ? AND is_from_me = 1 AND IFNULL(ack, 0) < ?`,
+		ack, id, chatJID, ack)
+	return err
+}
+
+// receiptAck traduz o tipo do whatsmeow pro inteiro que a UI desenha.
+// Delivered chega com type vazio; played de áudio conta como lida (é o que o
+// celular mostra). O resto (retry, sender, inactive…) não muda o tick.
+func receiptAck(t types.ReceiptType) int {
+	switch t {
+	case types.ReceiptTypeDelivered:
+		return 2
+	case types.ReceiptTypeRead, types.ReceiptTypePlayed:
+		return 3
+	default:
+		return 0
+	}
 }
 
 // SetTranscript grava a transcrição do áudio na linha dele. Fica fora do UPSERT do
@@ -1023,6 +1055,43 @@ func sendWhatsAppReaction(client *whatsmeow.Client, messageStore *MessageStore, 
 	return true, "ok"
 }
 
+// sendWhatsAppRead marca as mensagens como lidas no protocolo (o outro lado vê o tick
+// azul). Fora da janela de horário: ler não é recado — o celular também marca de madrugada.
+// Em grupo o sender precisa ser quem escreveu (MarkRead só aceita um remetente por chamada).
+func sendWhatsAppRead(client *whatsmeow.Client, recipient string, messageIDs []string, sender string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	chat, err := parseRecipientJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+	ids := make([]types.MessageID, 0, len(messageIDs))
+	for _, id := range messageIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids = append(ids, types.MessageID(id))
+		}
+	}
+	if len(ids) == 0 {
+		return false, "message_ids is required"
+	}
+	if len(ids) > 50 {
+		ids = ids[:50]
+	}
+	senderJID := types.EmptyJID
+	if strings.TrimSpace(sender) != "" {
+		senderJID, err = parseRecipientJID(sender)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing sender: %v", err)
+		}
+	}
+	if err := client.MarkRead(context.Background(), ids, time.Now(), chat, senderJID); err != nil {
+		return false, fmt.Sprintf("Error sending read receipt: %v", err)
+	}
+	return true, fmt.Sprintf("Read receipt sent to %s", recipient)
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -1174,6 +1243,29 @@ func resolveJID(client *whatsmeow.Client, jid types.JID) types.JID {
 		return jid
 	}
 	return pn
+}
+
+// Recibo de entrega/leitura das mensagens que NÓS mandamos. Chat pode chegar
+// como LID: resolve pra o mesmo JID que o StoreMessage gravou, e tenta o
+// original se o resolve falhar (mensagem antiga no store ainda em LID).
+func handleReceipt(client *whatsmeow.Client, messageStore *MessageStore, evt *events.Receipt, logger waLog.Logger) {
+	ack := receiptAck(evt.Type)
+	if ack == 0 || len(evt.MessageIDs) == 0 {
+		return
+	}
+	chat := resolveJID(client, evt.Chat).ToNonAD()
+	chatJID := chat.String()
+	alt := evt.Chat.ToNonAD().String()
+	for _, id := range evt.MessageIDs {
+		if err := messageStore.SetAck(string(id), chatJID, ack); err != nil {
+			logger.Warnf("Failed to store receipt %s %s: %v", id, chatJID, err)
+		}
+		if alt != chatJID {
+			if err := messageStore.SetAck(string(id), alt, ack); err != nil {
+				logger.Warnf("Failed to store receipt %s %s: %v", id, alt, err)
+			}
+		}
+	}
 }
 
 // Handle regular incoming messages with media support
@@ -1567,6 +1659,32 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 	})
 
+	mux.HandleFunc("/api/read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient  string   `json:"recipient"`
+			MessageIDs []string `json:"message_ids"`
+			Sender     string   `json:"sender"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || len(req.MessageIDs) == 0 {
+			http.Error(w, "Recipient and message_ids are required", http.StatusBadRequest)
+			return
+		}
+		success, message := sendWhatsAppRead(client, req.Recipient, req.MessageIDs, req.Sender)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
 	// Handler for downloading media
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -1760,6 +1878,9 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger, cfg.AutoTranscribe)
+
+		case *events.Receipt:
+			handleReceipt(client, messageStore, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events

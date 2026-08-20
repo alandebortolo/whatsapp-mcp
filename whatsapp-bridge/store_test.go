@@ -29,7 +29,7 @@ func testStore(t *testing.T) *MessageStore {
 			id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
 			is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB,
 			file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER,
-			quoted_id TEXT, quoted_sender TEXT, quoted_text TEXT, transcript TEXT,
+			quoted_id TEXT, quoted_sender TEXT, quoted_text TEXT, transcript TEXT, ack INTEGER,
 			PRIMARY KEY (id, chat_jid), FOREIGN KEY (chat_jid) REFERENCES chats(jid));`); err != nil {
 		t.Fatal(err)
 	}
@@ -272,6 +272,84 @@ func TestSetTranscriptSurvivesRedelivery(t *testing.T) {
 	}
 }
 
+func TestReceiptAckLevel(t *testing.T) {
+	if receiptAck(types.ReceiptTypeDelivered) != 2 {
+		t.Fatalf("delivered: %d", receiptAck(types.ReceiptTypeDelivered))
+	}
+	if receiptAck(types.ReceiptTypeRead) != 3 || receiptAck(types.ReceiptTypePlayed) != 3 {
+		t.Fatal("read/played tinham que virar 3")
+	}
+	if receiptAck(types.ReceiptTypeRetry) != 0 || receiptAck(types.ReceiptTypeSender) != 0 {
+		t.Fatal("retry/sender não mudam o tick")
+	}
+}
+
+func TestSetAckNeverDowngradesAndSurvivesRedelivery(t *testing.T) {
+	s := testStore(t)
+	jid := "5511999999999@s.whatsapp.net"
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.TouchChat(jid, "Contato", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("OUT1", jid, "eu", "oi", now, true,
+		"", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	var ack int
+	if err := s.db.QueryRow("SELECT IFNULL(ack,0) FROM messages WHERE id='OUT1'").Scan(&ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack != 1 {
+		t.Fatalf("from_me nova começa em enviada (1), veio %d", ack)
+	}
+	if err := s.SetAck("OUT1", jid, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAck("OUT1", jid, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAck("OUT1", jid, 2); err != nil { // não desce
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("OUT1", jid, "eu", "oi", now, true,
+		"", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT IFNULL(ack,0) FROM messages WHERE id='OUT1'").Scan(&ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack != 3 {
+		t.Fatalf("lida tem que sobreviver a recibo velho e a reentrega: %d", ack)
+	}
+	// incoming não ganha ack
+	if err := s.StoreMessage("IN1", jid, "5511999999999", "eae", now, false,
+		"", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAck("IN1", jid, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT IFNULL(ack,0) FROM messages WHERE id='IN1'").Scan(&ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack != 0 {
+		t.Fatalf("mensagem deles não leva tick nosso: %d", ack)
+	}
+}
+
+func TestNewMessageStoreAddsAckColumn(t *testing.T) {
+	s, err := NewMessageStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	var name string
+	if err := s.db.QueryRow(
+		`SELECT name FROM pragma_table_info('messages') WHERE name='ack'`).Scan(&name); err != nil {
+		t.Fatalf("coluna ack não nasceu: %v", err)
+	}
+}
+
 // Sem o TouchChat antes, a FK rejeita — a regressão que o comentário no envio previne.
 func TestStoreMessageNeedsChatRow(t *testing.T) {
 	s := testStore(t)
@@ -408,7 +486,7 @@ func TestQuotedContextInfo(t *testing.T) {
 			Text: proto.String("concordo"), ContextInfo: ctx()}},
 		"imagem": {ImageMessage: &waProto.ImageMessage{
 			Caption: proto.String("essa aqui"), ContextInfo: ctx()}},
-		"audio": {AudioMessage: &waProto.AudioMessage{ContextInfo: ctx()}},
+		"audio":     {AudioMessage: &waProto.AudioMessage{ContextInfo: ctx()}},
 		"documento": {DocumentMessage: &waProto.DocumentMessage{ContextInfo: ctx()}},
 	}
 	for kind, msg := range cases {
