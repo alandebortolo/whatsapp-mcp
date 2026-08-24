@@ -165,7 +165,9 @@ def get_message_context(
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    reply_to: str = "",
+    mentions: List[str] = []
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -173,7 +175,11 @@ def send_message(
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+        reply_to: Optional id of a message in this chat to quote-reply to (the human gesture for
+                 answering a specific message in a busy group)
+        mentions: Optional list of JIDs to @-mention; the message text must contain the matching
+                 @<number> token for each (e.g. "@5511999999999"), which WhatsApp renders as the name
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -183,9 +189,10 @@ def send_message(
             "success": False,
             "message": "Recipient must be provided"
         }
-    
+
     # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
+    success, status_message = whatsapp_send_message(recipient, message, reply_to=reply_to,
+                                                    mentions=mentions or None)
     return {
         "success": success,
         "message": status_message

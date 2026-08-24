@@ -347,6 +347,16 @@ func (store *MessageStore) GetMessageMeta(id, chatJID string) (fromMe bool, send
 	return fromMe, sender, err == nil
 }
 
+// GetMessageQuote é o GetMessageMeta + o texto: o retrato mínimo que o ContextInfo de uma
+// resposta-citação precisa (StanzaID vem do caller, Participant do sender, QuotedMessage do content).
+func (store *MessageStore) GetMessageQuote(id, chatJID string) (fromMe bool, sender, content string, ok bool) {
+	err := store.db.QueryRow(
+		`SELECT is_from_me, IFNULL(sender, ''), IFNULL(content, '') FROM messages WHERE id = ? AND chat_jid = ?`,
+		id, chatJID,
+	).Scan(&fromMe, &sender, &content)
+	return fromMe, sender, content, err == nil
+}
+
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
@@ -805,13 +815,15 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient string   `json:"recipient"`
+	Message   string   `json:"message"`
+	MediaPath string   `json:"media_path,omitempty"`
+	ReplyTo   string   `json:"reply_to,omitempty"` // id de mensagem do histórico local: envia CITANDO ela
+	Mentions  []string `json:"mentions,omitempty"` // jids mencionados; o texto leva o token @<numero>
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo string, mentions []string) (bool, string) {
 	if !whatsappSendAllowedAt(time.Now()) {
 		return false, whatsappQuietHoursMessage()
 	}
@@ -974,6 +986,41 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		}
+	} else if replyTo != "" || len(mentions) > 0 {
+		// Resposta-citação e/ou menção: ambas moram no ContextInfo, que só existe no
+		// ExtendedTextMessage — Conversation puro não carrega nenhum dos dois.
+		ctxInfo := &waProto.ContextInfo{}
+		if replyTo != "" {
+			qFromMe, qSender, qText, ok := messageStore.GetMessageQuote(replyTo, recipientJID.String())
+			if !ok {
+				return false, fmt.Sprintf("reply_to %s não está no histórico local desta conversa", replyTo)
+			}
+			participant := qSender
+			if qFromMe {
+				participant = client.Store.ID.ToNonAD().String()
+			} else if participant == "" {
+				participant = recipientJID.String() // 1:1: o autor da citada é o próprio contato
+			} else if !strings.Contains(participant, "@") {
+				participant += "@s.whatsapp.net" // o store guarda só o user em grupo
+			}
+			ctxInfo.StanzaID = proto.String(replyTo)
+			ctxInfo.Participant = proto.String(participant)
+			ctxInfo.QuotedMessage = &waProto.Message{Conversation: proto.String(qText)}
+		}
+		for _, m := range mentions {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			if !strings.Contains(m, "@") {
+				m += "@s.whatsapp.net"
+			}
+			ctxInfo.MentionedJID = append(ctxInfo.MentionedJID, m)
+		}
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        proto.String(message),
+			ContextInfo: ctxInfo,
+		}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
@@ -1090,6 +1137,41 @@ func sendWhatsAppRead(client *whatsmeow.Client, recipient string, messageIDs []s
 		return false, fmt.Sprintf("Error sending read receipt: %v", err)
 	}
 	return true, fmt.Sprintf("Read receipt sent to %s", recipient)
+}
+
+// sendWhatsAppChatPresence mostra "digitando…" (composing) ou some com ele (paused) na
+// conversa — é o que o autopilot usa entre o tique azul e o envio, pra resposta não se
+// materializar do nada. composing exige presença global available antes (sem isso o outro
+// lado não vê nada); paused devolve unavailable pro celular do dono voltar a receber as
+// notificações (companion "online" silencia o aparelho).
+func sendWhatsAppChatPresence(client *whatsmeow.Client, recipient, state string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	chat, err := parseRecipientJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+	ctx := context.Background()
+	switch state {
+	case "composing", "":
+		if err := client.SendPresence(ctx, types.PresenceAvailable); err != nil {
+			return false, fmt.Sprintf("Error sending presence: %v", err)
+		}
+		if err := client.SendChatPresence(ctx, chat, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
+			return false, fmt.Sprintf("Error sending chat presence: %v", err)
+		}
+	case "paused":
+		if err := client.SendChatPresence(ctx, chat, types.ChatPresencePaused, types.ChatPresenceMediaText); err != nil {
+			return false, fmt.Sprintf("Error sending chat presence: %v", err)
+		}
+		if err := client.SendPresence(ctx, types.PresenceUnavailable); err != nil {
+			return false, fmt.Sprintf("Error sending presence: %v", err)
+		}
+	default:
+		return false, "state must be composing or paused"
+	}
+	return true, fmt.Sprintf("Presence %s sent to %s", state, recipient)
 }
 
 // Extract media info from a message
@@ -1616,7 +1698,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo, req.Mentions)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1678,6 +1760,33 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			return
 		}
 		success, message := sendWhatsAppRead(client, req.Recipient, req.MessageIDs, req.Sender)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Presença por conversa ("digitando…"): cosmética, sem janela de horário — quem manda
+	// mensagem de verdade é o /api/send, que já bloqueia fora do horário seguro.
+	mux.HandleFunc("/api/presence", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient"`
+			State     string `json:"state"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+		success, message := sendWhatsAppChatPresence(client, req.Recipient, req.State)
 		w.Header().Set("Content-Type", "application/json")
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
