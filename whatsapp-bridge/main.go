@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,6 +20,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +31,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -1439,6 +1442,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		if autoTranscribe && mediaType == "audio" && !msg.Info.IsFromMe && chat.Server == types.DefaultUserServer {
 			go transcribeAndReply(client, messageStore, msg, chat, logger)
 		}
+
+		// Arquivo REENCAMINHADO chega com a assinatura do upload original, que pode já ter
+		// vencido — e o reupload só existe enquanto o aparelho de quem mandou ainda tem o
+		// arquivo (horas depois o celular responde NOT_FOUND). Quando a URL já nasce
+		// vencida, buscamos AGORA: é a única janela em que dá.
+		if mediaType != "" && mediaURLExpired(url, time.Now()) {
+			go func() {
+				fmt.Printf("Media for %s arrived with an expired signature, fetching it now...\n", msg.Info.ID)
+				if _, _, _, _, err := downloadMedia(client, messageStore, msg.Info.ID, chat.String()); err != nil {
+					logger.Warnf("Failed to rescue expired media %s: %v", msg.Info.ID, err)
+				}
+			}()
+		}
 	}
 }
 
@@ -1612,8 +1628,31 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	// Download the media using whatsmeow client. Assinatura já vencida não vale a viagem: o
+	// CDN só devolve 403 e, depois de algumas seguidas, devolve devagar (medido: minutos
+	// pendurado). Nesse caso vamos direto para as vias que resolvem.
+	var mediaData []byte
+	if mediaURLExpired(url, time.Now()) {
+		err = errMediaURLExpired
+	} else {
+		dlCtx, cancelDl := context.WithTimeout(context.Background(), mediaDownloadTimeout)
+		mediaData, err = client.Download(dlCtx, downloader)
+		cancelDl()
+	}
+	if err != nil && isExpiredMediaError(err) {
+		// O CDN nega mídia antiga ou reencaminhada (a assinatura da URL vence em ~3 meses).
+		// A via do protocolo é pedir ao aparelho de quem mandou que suba de novo — vale
+		// enquanto ele ainda tem o arquivo. (O cache do WhatsApp Desktop deste Mac é a outra
+		// via, e mora no Clauditor: tocar no container de outro app pendura ESTE processo,
+		// que não tem Acesso Total ao Disco — medido em 25/08/2026.)
+		fmt.Printf("Media for %s expired on the CDN (%v), asking the sender to re-upload...\n", messageID, err)
+		data, retryErr := retryExpiredMedia(client, messageStore, messageID, chatJID, downloader)
+		if retryErr != nil {
+			err = fmt.Errorf("%v (re-upload request also failed: %v)", err, retryErr)
+		} else {
+			mediaData, err = data, nil
+		}
+	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -1625,6 +1664,127 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// O WhatsApp assina a URL da mídia com tokens (oh/oe) que vencem em ~3 meses, e mensagem
+// REENCAMINHADA carrega o upload ORIGINAL — por isso um arquivo antigo repassado hoje dá 403
+// aqui enquanto o app no celular abre numa boa (ele pede reupload sozinho). Fazíamos o mesmo
+// que nada: devolver "403" pro chamador, que virava "não consegui, é técnico" na cara do
+// cliente. O remédio é o do próprio protocolo — media retry (25/08/2026).
+const (
+	mediaRetryTimeout    = 30 * time.Second
+	mediaDownloadTimeout = 60 * time.Second
+)
+
+// errMediaURLExpired é o 403 que dá pra prever pelo próprio link, sem chamar o CDN.
+var errMediaURLExpired = errors.New("media URL signature expired")
+
+var mediaRetries = struct {
+	sync.Mutex
+	waiting map[string]chan *events.MediaRetry
+}{waiting: make(map[string]chan *events.MediaRetry)}
+
+// handleMediaRetry entrega a resposta do celular do remetente a quem está esperando por ela.
+func handleMediaRetry(evt *events.MediaRetry) {
+	mediaRetries.Lock()
+	ch, ok := mediaRetries.waiting[evt.MessageID]
+	mediaRetries.Unlock()
+	if ok {
+		select {
+		case ch <- evt:
+		default:
+		}
+	}
+}
+
+// mediaURLExpired lê o `oe` (unix em hex) que o WhatsApp põe na URL assinada e diz se ela
+// já morreu. Sem o parâmetro, assume viva: chutar "vencida" custaria um pedido de reupload
+// à toa em toda mídia normal.
+func mediaURLExpired(url string, now time.Time) bool {
+	idx := strings.Index(url, "oe=")
+	if idx < 0 {
+		return false
+	}
+	raw := url[idx+3:]
+	if end := strings.IndexByte(raw, '&'); end >= 0 {
+		raw = raw[:end]
+	}
+	exp, err := strconv.ParseInt(raw, 16, 64)
+	if err != nil {
+		return false
+	}
+	return now.After(time.Unix(exp, 0))
+}
+
+// isExpiredMediaError diz se vale pedir reupload: o CDN só responde 403/404/410 quando o
+// arquivo saiu de lá. Erro de rede/hash é outra história e o whatsmeow já tenta de novo.
+func isExpiredMediaError(err error) bool {
+	return errors.Is(err, errMediaURLExpired) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+}
+
+// retryExpiredMedia pede ao aparelho de quem mandou que suba o arquivo de novo e baixa pelo
+// caminho novo. Depende do celular do remetente estar online — se não estiver, o erro diz isso.
+func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, d *MediaDownloader) ([]byte, error) {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chat jid: %v", err)
+	}
+	var sender string
+	var isFromMe bool
+	if err := messageStore.db.QueryRow(
+		"SELECT IFNULL(sender, ''), is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID,
+	).Scan(&sender, &isFromMe); err != nil {
+		return nil, fmt.Errorf("failed to read message: %v", err)
+	}
+	senderJID := chat
+	if sender != "" {
+		senderJID = types.NewJID(sender, types.DefaultUserServer)
+	}
+	info := &types.MessageInfo{
+		ID: messageID,
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			Sender:   senderJID,
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+	}
+
+	ch := make(chan *events.MediaRetry, 1)
+	mediaRetries.Lock()
+	mediaRetries.waiting[messageID] = ch
+	mediaRetries.Unlock()
+	defer func() {
+		mediaRetries.Lock()
+		delete(mediaRetries.waiting, messageID)
+		mediaRetries.Unlock()
+	}()
+
+	askCtx, cancelAsk := context.WithTimeout(context.Background(), mediaRetryTimeout)
+	defer cancelAsk()
+	if err := client.SendMediaRetryReceipt(askCtx, info, d.MediaKey); err != nil {
+		return nil, fmt.Errorf("failed to ask for re-upload: %v", err)
+	}
+
+	select {
+	case evt := <-ch:
+		notif, err := whatsmeow.DecryptMediaRetryNotification(evt, d.MediaKey)
+		if err != nil {
+			return nil, fmt.Errorf("re-upload answer unreadable: %v", err)
+		}
+		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+			return nil, fmt.Errorf("sender refused the re-upload: %s", notif.GetResult())
+		}
+		dlCtx, cancelDl := context.WithTimeout(context.Background(), mediaRetryTimeout)
+		defer cancelDl()
+		return client.DownloadMediaWithPath(dlCtx, notif.GetDirectPath(), d.FileEncSHA256, d.FileSHA256, d.MediaKey, d.MediaType, "", false)
+	case <-askCtx.Done():
+		return nil, fmt.Errorf("no re-upload answer from the sender's phone within %s", mediaRetryTimeout)
+	}
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -1990,6 +2150,9 @@ func main() {
 
 		case *events.Receipt:
 			handleReceipt(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			handleMediaRetry(v)
 
 		case *events.HistorySync:
 			// Process history sync events
