@@ -431,7 +431,50 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	// Cartão de contato (vCard) não tem Conversation nem mídia: descartado calado,
+	// o número que a pessoa mandou some da conversa (medido 26/08: 8 cartões
+	// perdidos num dia). Vira texto legível — o que interessa é nome/tel/e-mail.
+	if c := msg.GetContactMessage(); c != nil {
+		return contactText(c.GetDisplayName(), c.GetVcard())
+	}
+	if arr := msg.GetContactsArrayMessage(); arr != nil {
+		var parts []string
+		for _, c := range arr.GetContacts() {
+			if t := contactText(c.GetDisplayName(), c.GetVcard()); t != "" {
+				parts = append(parts, t)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+
 	return interactiveText(msg)
+}
+
+// contactText resume um vCard numa linha: "[contato] Nome: tel | e-mail".
+// Só TEL/EMAIL interessam pra conversa; o valor vem depois do primeiro ":".
+func contactText(name, vcard string) string {
+	var fields []string
+	for _, line := range strings.Split(vcard, "\n") {
+		u := strings.ToUpper(strings.TrimSpace(line))
+		if strings.HasPrefix(u, "TEL") || strings.HasPrefix(u, "EMAIL") {
+			if kv := strings.SplitN(line, ":", 2); len(kv) == 2 && strings.TrimSpace(kv[1]) != "" {
+				fields = append(fields, strings.TrimSpace(kv[1]))
+			}
+		}
+	}
+	out := strings.TrimSpace(name)
+	if len(fields) > 0 {
+		if out != "" {
+			out += ": "
+		}
+		out += strings.Join(fields, " | ")
+	}
+	if out == "" {
+		return ""
+	}
+	return "[contato] " + out
 }
 
 // Efêmera, ver-uma-vez e editada não são um tipo de mensagem: são um envelope em volta

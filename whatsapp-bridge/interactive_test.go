@@ -94,3 +94,37 @@ func TestQuotedContextInfoOnButtonResponse(t *testing.T) {
 		t.Fatalf("resposta de botão perdeu a citação: %v", ci)
 	}
 }
+
+// O bug: cartão de contato (vCard) chegava sem texto e sem mídia e o handler
+// descartava — o número que a pessoa mandou sumia da conversa (26/08/2026:
+// 8 cartões perdidos num dia; o do caso Alliance foi resgatado do ChatStorage
+// do WhatsApp Desktop). O vCard do primeiro caso é o real, na íntegra.
+func TestExtractTextContentContact(t *testing.T) {
+	vcard := "BEGIN:VCARD\nVERSION:3.0\nN:Bonacho Site Web;Vinicius;;;\nFN:Vinicius Bonacho Site Web\nTEL;type=CELL;type=VOICE;waid=5527988230464:+55 27 98823-0464\nEMAIL;type=INTERNET;type=HOME:vinicius@unicocomunicacao.com\nEND:VCARD"
+	cases := []struct {
+		name string
+		msg  *waProto.Message
+		want string
+	}{
+		{"contact", &waProto.Message{ContactMessage: &waProto.ContactMessage{
+			DisplayName: proto.String("Vinicius Bonacho Site Web"),
+			Vcard:       proto.String(vcard),
+		}}, "[contato] Vinicius Bonacho Site Web: +55 27 98823-0464 | vinicius@unicocomunicacao.com"},
+
+		{"contacts array", &waProto.Message{ContactsArrayMessage: &waProto.ContactsArrayMessage{
+			Contacts: []*waProto.ContactMessage{
+				{DisplayName: proto.String("Fulano"), Vcard: proto.String("BEGIN:VCARD\nTEL:+55 11 1111-1111\nEND:VCARD")},
+				{DisplayName: proto.String("Beltrana"), Vcard: proto.String("BEGIN:VCARD\nTEL;waid=5522922222222:+55 22 2222-2222\nEND:VCARD")},
+			},
+		}}, "[contato] Fulano: +55 11 1111-1111\n[contato] Beltrana: +55 22 2222-2222"},
+
+		{"vcard vazio cai no nome", &waProto.Message{ContactMessage: &waProto.ContactMessage{
+			DisplayName: proto.String("Só Nome"),
+		}}, "[contato] Só Nome"},
+	}
+	for _, tc := range cases {
+		if got := extractTextContent(tc.msg); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
