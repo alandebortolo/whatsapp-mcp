@@ -1074,6 +1074,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// Send message
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
+	// "no LID found ... from server" on a personal chat means we addressed a JID the server
+	// doesn't know — almost always a Brazilian number whose WhatsApp is registered WITHOUT
+	// the 9th digit (an app signup form gladly stores +55 42 99810-2118 while the account
+	// lives at 554298102118). Ask the server for the canonical JID and retry once, instead of
+	// making every caller guess the variant and risk messaging a stranger.
+	if err != nil && recipientJID.Server == types.DefaultUserServer && strings.Contains(err.Error(), "no LID found") {
+		if canonical, ok := canonicalUserJID(client, recipientJID); ok && canonical.User != recipientJID.User {
+			fmt.Printf("send: %s has no LID, retrying at canonical %s\n", recipientJID, canonical)
+			recipientJID = canonical
+			resp, err = client.SendMessage(context.Background(), recipientJID, msg)
+		}
+	}
+
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
@@ -1106,7 +1119,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		fmt.Printf("Warning: message sent but not stored locally: %v\n", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	// recipientJID, not the requested string: a canonical-JID retry may have re-addressed
+	// the message, and the caller needs the JID the conversation actually lives at.
+	return true, fmt.Sprintf("Message sent to %s", recipientJID)
 }
 
 // sendWhatsAppReaction manda uma reação (emoji vazio = tira). Fora da janela de
@@ -1356,6 +1371,28 @@ func transcribeAndReply(client *whatsmeow.Client, messageStore *MessageStore, ms
 	} else {
 		logger.Infof("transcricao enviada para %s (%d chars)", chat.String(), len(text))
 	}
+}
+
+// canonicalUserJID asks the server which JID actually owns a phone number. Brazilian
+// numbers are the reason this exists: a 2010s line is registered on WhatsApp with 8
+// digits (554298102118) while every form, CRM and signup screen stores the 9-digit
+// form (5542998102118), and addressing the 9-digit JID fails with "no LID found".
+// Returns ok=false when the number is not on WhatsApp at all, so the caller can tell
+// "wrong variant" from "no WhatsApp" instead of guessing.
+func canonicalUserJID(client *whatsmeow.Client, jid types.JID) (types.JID, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	resp, err := client.IsOnWhatsApp(ctx, []string{"+" + jid.User})
+	if err != nil {
+		return jid, false
+	}
+	for _, item := range resp {
+		if item.IsIn {
+			return item.JID.ToNonAD(), true
+		}
+	}
+	return jid, false
 }
 
 // resolveJID maps a LID JID (WhatsApp's post-2026 privacy identifier) back to
@@ -2046,6 +2083,59 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Handler to check whether phone numbers are registered on WhatsApp, WITHOUT sending
+	// anything. GET /api/exists?phone=+5542998102118[,+5542...] — comma-separated.
+	// Answers the question a failed send can't: "no LID found from server" means either
+	// the number has no WhatsApp or the JID is a different variant (BR 8-vs-9 digits), and
+	// the only safe way to tell them apart is asking the server instead of probing by sending
+	// a message to a stranger. The response carries the canonical JID to send to.
+	mux.HandleFunc("/api/exists", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		raw := r.URL.Query().Get("phone")
+		if raw == "" {
+			http.Error(w, "phone is required", http.StatusBadRequest)
+			return
+		}
+		phones := []string{}
+		for _, p := range strings.Split(raw, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if !strings.HasPrefix(p, "+") { // whatsmeow wants international format with +
+				p = "+" + p
+			}
+			phones = append(phones, p)
+		}
+		if len(phones) == 0 {
+			http.Error(w, "phone is required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+
+		resp, err := client.IsOnWhatsApp(ctx, phones)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+		results := make([]map[string]any, 0, len(resp))
+		for _, item := range resp {
+			results = append(results, map[string]any{
+				"query": item.Query,
+				"is_on_whatsapp": item.IsIn,
+				"jid": item.JID.String(),
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "results": results})
 	})
 
 	// Handler for profile pictures (avatars). GET /api/avatar?jid=<jid>
