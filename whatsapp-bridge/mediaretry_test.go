@@ -71,3 +71,28 @@ func TestHandleMediaRetryEntregaAQuemEspera(t *testing.T) {
 	// Sem ninguém esperando (o download já desistiu), não pode travar nem entrar em pânico.
 	handleMediaRetry(&events.MediaRetry{MessageID: types.MessageID("MSG-ORFA")})
 }
+
+// Celular já disse que não tem (ou não respondeu): pedir de novo a cada consulta vira UMA
+// notificação "sincronização interrompida" no iPhone por pedido — 89 em 25 min para um status
+// com link vencido, medido em 02/09/2026. A recusa vale por mediaRetryCooldown.
+func TestMediaRetryCooldownNaoPedeDeNovo(t *testing.T) {
+	now := time.Date(2026, 9, 2, 8, 8, 55, 0, time.UTC)
+	defer func() {
+		mediaRetries.Lock()
+		delete(mediaRetries.failed, "STATUS-MORTO")
+		mediaRetries.Unlock()
+	}()
+	if mediaRetryDenied("STATUS-MORTO", now) {
+		t.Fatal("sem falha registrada não pode negar")
+	}
+	noteMediaRetryFailed("STATUS-MORTO", now)
+	if !mediaRetryDenied("STATUS-MORTO", now.Add(10*time.Second)) {
+		t.Fatal("10s depois da recusa tinha que negar o novo pedido")
+	}
+	if mediaRetryDenied("OUTRA-MSG", now) {
+		t.Fatal("cooldown vazou para outra mensagem")
+	}
+	if mediaRetryDenied("STATUS-MORTO", now.Add(mediaRetryCooldown+time.Second)) {
+		t.Fatal("cooldown vencido tinha que liberar um pedido novo")
+	}
+}

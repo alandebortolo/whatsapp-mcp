@@ -1725,7 +1725,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		// enquanto ele ainda tem o arquivo. (O cache do WhatsApp Desktop deste Mac é a outra
 		// via, e mora no Clauditor: tocar no container de outro app pendura ESTE processo,
 		// que não tem Acesso Total ao Disco — medido em 25/08/2026.)
-		fmt.Printf("Media for %s expired on the CDN (%v), asking the sender to re-upload...\n", messageID, err)
+		fmt.Printf("Media for %s expired on the CDN (%v)\n", messageID, err)
 		data, retryErr := retryExpiredMedia(client, messageStore, messageID, chatJID, downloader)
 		if retryErr != nil {
 			err = fmt.Errorf("%v (re-upload request also failed: %v)", err, retryErr)
@@ -1759,10 +1759,31 @@ const (
 // errMediaURLExpired é o 403 que dá pra prever pelo próprio link, sem chamar o CDN.
 var errMediaURLExpired = errors.New("media URL signature expired")
 
+// mediaRetryCooldown: depois que o celular recusou (ou não respondeu) o reupload, não
+// perguntamos de novo por este tempo. Cada pedido vira UMA notificação "sincronização com o
+// outro dispositivo foi interrompida" no iPhone do dono — e consulta repetida (poll, dashboard
+// re-renderizando a imagem) fazia 89 pedidos em 25 min para um status morto (02/09/2026).
+const mediaRetryCooldown = time.Hour
+
 var mediaRetries = struct {
 	sync.Mutex
 	waiting map[string]chan *events.MediaRetry
-}{waiting: make(map[string]chan *events.MediaRetry)}
+	failed  map[string]time.Time // messageID → quando o celular recusou/não respondeu
+}{waiting: make(map[string]chan *events.MediaRetry), failed: make(map[string]time.Time)}
+
+// mediaRetryDenied diz se este id ainda está no cooldown de um pedido que falhou.
+func mediaRetryDenied(messageID string, now time.Time) bool {
+	mediaRetries.Lock()
+	defer mediaRetries.Unlock()
+	t, ok := mediaRetries.failed[messageID]
+	return ok && now.Sub(t) < mediaRetryCooldown
+}
+
+func noteMediaRetryFailed(messageID string, now time.Time) {
+	mediaRetries.Lock()
+	mediaRetries.failed[messageID] = now
+	mediaRetries.Unlock()
+}
 
 // handleMediaRetry entrega a resposta do celular do remetente a quem está esperando por ela.
 func handleMediaRetry(evt *events.MediaRetry) {
@@ -1812,6 +1833,10 @@ func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, mes
 	if err != nil {
 		return nil, fmt.Errorf("invalid chat jid: %v", err)
 	}
+	if mediaRetryDenied(messageID, time.Now()) {
+		fmt.Printf("Media for %s: the phone already refused the re-upload; not asking again\n", messageID)
+		return nil, fmt.Errorf("the phone already refused (or ignored) the re-upload less than %s ago; not asking again", mediaRetryCooldown)
+	}
 	var sender string
 	var isFromMe bool
 	if err := messageStore.db.QueryRow(
@@ -1846,6 +1871,7 @@ func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, mes
 
 	askCtx, cancelAsk := context.WithTimeout(context.Background(), mediaRetryTimeout)
 	defer cancelAsk()
+	fmt.Printf("Media for %s: asking the sender to re-upload...\n", messageID)
 	if err := client.SendMediaRetryReceipt(askCtx, info, d.MediaKey); err != nil {
 		return nil, fmt.Errorf("failed to ask for re-upload: %v", err)
 	}
@@ -1854,15 +1880,18 @@ func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, mes
 	case evt := <-ch:
 		notif, err := whatsmeow.DecryptMediaRetryNotification(evt, d.MediaKey)
 		if err != nil {
+			noteMediaRetryFailed(messageID, time.Now()) // inclui "media no longer available on phone"
 			return nil, fmt.Errorf("re-upload answer unreadable: %v", err)
 		}
 		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+			noteMediaRetryFailed(messageID, time.Now())
 			return nil, fmt.Errorf("sender refused the re-upload: %s", notif.GetResult())
 		}
 		dlCtx, cancelDl := context.WithTimeout(context.Background(), mediaRetryTimeout)
 		defer cancelDl()
 		return client.DownloadMediaWithPath(dlCtx, notif.GetDirectPath(), d.FileEncSHA256, d.FileSHA256, d.MediaKey, d.MediaType, "", false)
 	case <-askCtx.Done():
+		noteMediaRetryFailed(messageID, time.Now())
 		return nil, fmt.Errorf("no re-upload answer from the sender's phone within %s", mediaRetryTimeout)
 	}
 }
