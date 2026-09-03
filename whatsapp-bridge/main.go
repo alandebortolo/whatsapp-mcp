@@ -197,7 +197,9 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// transcript: texto da transcrição automática do áudio (Whisper local), na PRÓPRIA linha
 	// do áudio — é daqui que o Clauditor lê em vez de rodar o whisper de novo.
 	// ack: recibo de entrega/leitura das NOSSAS mensagens (1=servidor, 2=entregue, 3=lida).
-	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT", "transcript TEXT", "ack INTEGER"} {
+	// revoked_at: quando a mensagem foi apagada "para todos". A linha FICA — o leitor marca
+	// "apagada" em cima do conteúdo, que continua visível (decisão do Alan, 03/09/2026).
+	for _, col := range []string{"quoted_id TEXT", "quoted_sender TEXT", "quoted_text TEXT", "transcript TEXT", "ack INTEGER", "revoked_at TIMESTAMP"} {
 		db.Exec("ALTER TABLE messages ADD COLUMN " + col)
 	}
 
@@ -317,6 +319,49 @@ func (store *MessageStore) SetTranscript(id, chatJID, text string) error {
 	_, err := store.db.Exec(
 		`UPDATE messages SET transcript = ? WHERE id = ? AND chat_jid = ?`, text, id, chatJID)
 	return err
+}
+
+// SetRevoked marca a mensagem como apagada "para todos" sem tirar a linha: o WhatsApp
+// oficial some com ela, aqui ela fica legível com a marca. Só a primeira revogação conta
+// (reentrega do mesmo ProtocolMessage não anda o horário). Alvo fora do store = 0 linhas,
+// sem erro: apagou algo que a ponte nunca viu.
+func (store *MessageStore) SetRevoked(id, chatJID string, ts time.Time) (int64, error) {
+	if id == "" || chatJID == "" {
+		return 0, nil
+	}
+	res, err := store.db.Exec(
+		`UPDATE messages SET revoked_at = ? WHERE id = ? AND chat_jid = ? AND revoked_at IS NULL`,
+		ts, id, chatJID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// applyRevoke trata o "apagar para todos", que chega como ProtocolMessage REVOKE com a
+// chave da mensagem alvo (do outro lado, ou do celular do dono). ok=false: não era
+// revogação. Vem ANTES do StoreChat no handleMessage: apagar não é mensagem nova, não
+// bumpa a conversa nem vira nudge.
+func applyRevoke(store *MessageStore, chatJID string, msg *events.Message, logger waLog.Logger) bool {
+	if msg == nil || msg.Message == nil {
+		return false
+	}
+	p := msg.Message.GetProtocolMessage()
+	if p == nil || p.GetType() != waProto.ProtocolMessage_REVOKE {
+		return false
+	}
+	id := p.GetKey().GetID()
+	if id == "" {
+		return true
+	}
+	n, err := store.SetRevoked(id, chatJID, msg.Info.Timestamp)
+	if err != nil {
+		logger.Warnf("revogação de %s em %s não gravada: %v", id, chatJID, err)
+	} else if n == 0 {
+		logger.Infof("revogação de %s em %s: mensagem alvo não está no store", id, chatJID)
+	}
+	return true
 }
 
 // StoreReaction grava ou apaga a reação de UMA pessoa numa mensagem. Emoji vazio
@@ -1163,6 +1208,37 @@ func sendWhatsAppReaction(client *whatsmeow.Client, messageStore *MessageStore, 
 	return true, "ok"
 }
 
+// sendWhatsAppRevoke apaga "para todos" uma mensagem NOSSA (o WhatsApp só deixa o autor
+// apagar; admin de grupo apagando alheio fica de fora de propósito). O revoke que nós
+// mandamos não volta como events.Message, então a marca local é gravada aqui.
+func sendWhatsAppRevoke(client *whatsmeow.Client, messageStore *MessageStore, recipient, messageID string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if strings.TrimSpace(messageID) == "" {
+		return false, "message_id is required"
+	}
+	chat, err := parseRecipientJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+	fromMe, _, ok := messageStore.GetMessageMeta(messageID, chat.String())
+	if !ok {
+		return false, "mensagem alvo não está no histórico local"
+	}
+	if !fromMe {
+		return false, "só apaga mensagem nossa"
+	}
+	resp, err := client.SendMessage(context.Background(), chat, client.BuildRevoke(chat, types.EmptyJID, types.MessageID(messageID)))
+	if err != nil {
+		return false, fmt.Sprintf("Error sending revoke: %v", err)
+	}
+	if _, err := messageStore.SetRevoked(messageID, chat.String(), resp.Timestamp); err != nil {
+		fmt.Printf("Warning: revoke sent but not stored locally: %v\n", err)
+	}
+	return true, "ok"
+}
+
 // sendWhatsAppRead marca as mensagens como lidas no protocolo (o outro lado vê o tick
 // azul). Fora da janela de horário: ler não é recado — o celular também marca de madrugada.
 // Em grupo o sender precisa ser quem escreveu (MarkRead só aceita um remetente por chamada).
@@ -1450,6 +1526,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 	if msg.Message != nil && (msg.Message.GetReactionMessage() != nil || msg.Message.GetEncReactionMessage() != nil) {
+		return
+	}
+	if applyRevoke(messageStore, chatJID, msg, logger) {
 		return
 	}
 
@@ -2003,6 +2082,33 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			return
 		}
 		success, message := sendWhatsAppReaction(client, messageStore, req.Recipient, req.MessageID, req.Emoji)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Apagar "para todos" uma mensagem nossa. Nasceu como superfície de teste do revoke
+	// recebido (03/09/2026): sem ela não há como provar a marca "apagada" sem celular.
+	mux.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient"`
+			MessageID string `json:"message_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.MessageID == "" {
+			http.Error(w, "Recipient and message_id are required", http.StatusBadRequest)
+			return
+		}
+		success, message := sendWhatsAppRevoke(client, messageStore, req.Recipient, req.MessageID)
 		w.Header().Set("Content-Type", "application/json")
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
