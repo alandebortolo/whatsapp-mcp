@@ -63,6 +63,8 @@ type runtimeConfig struct {
 	AccountName    string
 	StoreDir       string
 	QRPath         string
+	PairPhone      string
+	PairPath       string
 	BindAddress    string
 	Port           int
 	AutoTranscribe bool
@@ -73,6 +75,7 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 		AccountName:    strings.TrimSpace(os.Getenv("WHATSAPP_ACCOUNT_NAME")),
 		StoreDir:       strings.TrimSpace(os.Getenv("WHATSAPP_STORE_DIR")),
 		QRPath:         strings.TrimSpace(os.Getenv("WHATSAPP_QR_PATH")),
+		PairPhone:      strings.TrimSpace(os.Getenv("WHATSAPP_PAIR_PHONE")),
 		BindAddress:    strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_BIND")),
 		Port:           defaultBridgePort,
 		AutoTranscribe: true,
@@ -90,6 +93,8 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 			cfg.QRPath = filepath.Join(filepath.Dir(cfg.StoreDir), "qr.txt")
 		}
 	}
+	// O código de pareamento mora ao lado do QR: quem lê um lê o outro.
+	cfg.PairPath = filepath.Join(filepath.Dir(cfg.QRPath), "pair.txt")
 	if raw := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_PORT")); raw != "" {
 		port, err := strconv.Atoi(raw)
 		if err != nil || port < 1 || port > 65535 {
@@ -2440,6 +2445,8 @@ func main() {
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
+		// Código velho na tela é pior que tela vazia: quem digita não entende o erro.
+		os.Remove(cfg.PairPath)
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
 		if err != nil {
@@ -2448,8 +2455,31 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
+		asked := false
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				// WHATSAPP_PAIR_PHONE troca o QR por um código de 8 dígitos que a
+				// pessoa digita no próprio celular (WhatsApp > Aparelhos conectados >
+				// Conectar com número). É o único caminho quando quem pareia está
+				// longe: o QR roda a cada ~20s, então print/foto chega morto.
+				// O whatsmeow pede que isso saia DEPOIS do primeiro evento do canal.
+				if cfg.PairPhone != "" {
+					if asked {
+						continue
+					}
+					asked = true
+					code, err := client.PairPhone(context.Background(), cfg.PairPhone, true,
+						whatsmeow.PairClientChrome, "Chrome (macOS)")
+					if err != nil {
+						logger.Errorf("Failed to request pairing code for %s: %v", cfg.PairPhone, err)
+						return
+					}
+					fmt.Printf("\nPairing code for %s: %s\n", cfg.PairPhone, code)
+					if err := os.WriteFile(cfg.PairPath, []byte(code), 0600); err != nil {
+						logger.Warnf("Failed to write pairing code to %s: %v", cfg.PairPath, err)
+					}
+					continue
+				}
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				if err := os.WriteFile(cfg.QRPath, []byte(evt.Code), 0600); err != nil {

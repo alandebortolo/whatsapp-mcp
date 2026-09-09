@@ -92,6 +92,38 @@ func TestLoadRuntimeConfigRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+// Pareamento por código (WHATSAPP_PAIR_PHONE): o número entra como veio, e o
+// pair.txt nasce ao lado do qr.txt — quem lê um lê o outro. Sem a env, vazio:
+// a ponte segue no QR de sempre.
+func TestLoadRuntimeConfigPairPhone(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("WHATSAPP_STORE_DIR", filepath.Join(root, "store"))
+	t.Setenv("WHATSAPP_QR_PATH", "")
+	t.Setenv("WHATSAPP_BRIDGE_PORT", "")
+	t.Setenv("WHATSAPP_AUTO_TRANSCRIBE", "")
+
+	t.Setenv("WHATSAPP_PAIR_PHONE", "  5527997897241 ")
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairPhone != "5527997897241" {
+		t.Fatalf("unexpected pair phone: %q", cfg.PairPhone)
+	}
+	if want := filepath.Join(root, "pair.txt"); cfg.PairPath != want {
+		t.Fatalf("pair path %q, want %q", cfg.PairPath, want)
+	}
+
+	t.Setenv("WHATSAPP_PAIR_PHONE", "")
+	cfg, err = loadRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairPhone != "" {
+		t.Fatalf("pair phone should stay empty, got %q", cfg.PairPhone)
+	}
+}
+
 func TestNewMessageStoreUsesConfiguredDirectory(t *testing.T) {
 	storeDir := filepath.Join(t.TempDir(), "account-store")
 	store, err := NewMessageStore(storeDir)
