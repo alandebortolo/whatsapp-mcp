@@ -30,6 +30,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -794,6 +795,23 @@ func parseRecipientJID(recipient string) (types.JID, error) {
 		return types.ParseJID(recipient)
 	}
 	return types.JID{User: recipient, Server: "s.whatsapp.net"}, nil
+}
+
+// parseGroupJID exige jid de GRUPO. Sair e mexer em participante são operações que não
+// desfazem, então um número de pessoa digitado no lugar do grupo tem que morrer aqui, e
+// não virar uma chamada estranha ao servidor do WhatsApp.
+func parseGroupJID(raw string) (types.JID, error) {
+	if raw == "" {
+		return types.JID{}, fmt.Errorf("group is required")
+	}
+	jid, err := types.ParseJID(raw)
+	if err != nil {
+		return types.JID{}, fmt.Errorf("invalid group jid %q: %v", raw, err)
+	}
+	if jid.Server != types.GroupServer {
+		return types.JID{}, fmt.Errorf("not a group jid: %s", raw)
+	}
+	return jid, nil
 }
 
 func targetSenderJID(chat types.JID, fromMe bool, sender string) types.JID {
@@ -2145,6 +2163,207 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// ---- grupos ----
+	// Administrar grupo pelo terminal: ver onde ESTE número está, adicionar/remover
+	// participante e sair. Nasceu da migração dos grupos de clínica do número pessoal do
+	// Alan para o número de dev (10/09/2026): sem isto, só dava no celular, um grupo por vez.
+
+	// GET /api/groups — grupos deste número, e se ele administra cada um. Sem ser admin,
+	// adicionar participante é recusado pelo servidor do WhatsApp: é isso que decide se a
+	// migração dá pra fazer daqui ou se quem tem que adicionar é o dono do grupo.
+	mux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		groups, err := client.GetJoinedGroups(context.Background())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		var me types.JID
+		if client.Store.ID != nil {
+			me = client.Store.ID.ToNonAD()
+		}
+		myLID := client.Store.LID
+		out := make([]map[string]interface{}, 0, len(groups))
+		for _, g := range groups {
+			admin := false
+			for _, p := range g.Participants {
+				if !p.IsAdmin && !p.IsSuperAdmin {
+					continue
+				}
+				// O grupo pode endereçar por número OU por LID: comparar só um dos dois
+				// devolve "não sou admin" em grupo que eu administro.
+				if (me.User != "" && (p.JID.User == me.User || p.PhoneNumber.User == me.User)) ||
+					(myLID.User != "" && p.LID.User == myLID.User) {
+					admin = true
+					break
+				}
+			}
+			out = append(out, map[string]interface{}{
+				"jid":          g.JID.String(),
+				"name":         g.Name,
+				"participants": len(g.Participants),
+				"i_am_admin":   admin,
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true, "account": accountName, "groups": out,
+		})
+	})
+
+	// POST /api/group/participants — {"group":"...@g.us","action":"add"|"remove",
+	// "participants":["5527999999999", ...]}
+	mux.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Group        string   `json:"group"`
+			Action       string   `json:"action"`
+			Participants []string `json:"participants"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		group, err := parseGroupJID(req.Group)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.Participants) == 0 {
+			http.Error(w, "participants is required", http.StatusBadRequest)
+			return
+		}
+		action := whatsmeow.ParticipantChangeAdd
+		switch req.Action {
+		case "", "add":
+		case "remove":
+			action = whatsmeow.ParticipantChangeRemove
+		default:
+			http.Error(w, "action must be add or remove", http.StatusBadRequest)
+			return
+		}
+		jids := make([]types.JID, 0, len(req.Participants))
+		for _, p := range req.Participants {
+			jid, err := parseRecipientJID(p)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid participant %q: %v", p, err), http.StatusBadRequest)
+				return
+			}
+			jids = append(jids, jid)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		changed, err := client.UpdateGroupParticipants(context.Background(), group, jids, action)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		// O WhatsApp responde POR PARTICIPANTE: quem volta com Error != 0 não entrou
+		// (privacidade do número, já é membro, só deu pra mandar convite). A chamada
+		// inteira "dar certo" e ninguém ter entrado é justamente o caso que engana.
+		results := make([]map[string]interface{}, 0, len(changed))
+		failed := 0
+		for _, p := range changed {
+			if p.Error != 0 {
+				failed++
+			}
+			results = append(results, map[string]interface{}{"jid": p.JID.String(), "error": p.Error})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": failed == 0, "group": group.String(), "action": action,
+			"results": results,
+		})
+	})
+
+	// POST /api/group/leave — {"group":"...@g.us"}. Sair não tem desfazer: sem convite
+	// novo, este número não volta.
+	mux.HandleFunc("/api/group/leave", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Group string `json:"group"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		group, err := parseGroupJID(req.Group)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := client.LeaveGroup(context.Background(), group); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "left " + group.String()})
+	})
+
+	// POST /api/chat/mute — {"chat":"...@g.us"|"...@s.whatsapp.net","mute":true,
+	// "duration_hours":8}. Sem duration_hours (ou 0), silencia para sempre; mute:false
+	// devolve o som. Vale para grupo e para conversa de pessoa, igual ao app.
+	//
+	// Silenciar é app state, não mensagem: a mudança sobe pro WhatsApp e desce em TODOS os
+	// aparelhos deste número. Para LER o que está silenciado não há rota — o próprio
+	// whatsmeow já guarda em whatsmeow_chat_settings (muted_until) no store da conta.
+	mux.HandleFunc("/api/chat/mute", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Chat          string   `json:"chat"`
+			Mute          *bool    `json:"mute"`
+			DurationHours *float64 `json:"duration_hours"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Chat == "" {
+			http.Error(w, "chat is required", http.StatusBadRequest)
+			return
+		}
+		chat, err := parseRecipientJID(req.Chat)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid chat jid %q: %v", req.Chat, err), http.StatusBadRequest)
+			return
+		}
+		mute := true
+		if req.Mute != nil {
+			mute = *req.Mute
+		}
+		var duration time.Duration
+		if req.DurationHours != nil && *req.DurationHours > 0 {
+			duration = time.Duration(*req.DurationHours * float64(time.Hour))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := client.SendAppState(context.Background(), appstate.BuildMute(chat, mute, duration)); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		state := "unmuted"
+		if mute {
+			state = "muted"
+			if duration > 0 {
+				state = fmt.Sprintf("muted until %s", time.Now().Add(duration).Format(time.RFC3339))
+			}
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: state + " " + chat.String()})
 	})
 
 	// Presença por conversa ("digitando…"): cosmética, sem janela de horário — quem manda

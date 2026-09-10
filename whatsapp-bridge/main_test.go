@@ -76,3 +76,25 @@ func TestApplyRevoke(t *testing.T) {
 		t.Fatal("reentrega da mensagem apagou revoked_at")
 	}
 }
+
+// parseGroupJID é o freio de /api/group/leave e /api/group/participants: sair de grupo e
+// tirar gente não desfazem, então jid que não é de grupo tem que morrer antes da chamada.
+func TestParseGroupJID(t *testing.T) {
+	if jid, err := parseGroupJID("120363426638900169@g.us"); err != nil {
+		t.Fatalf("grupo válido recusado: %v", err)
+	} else if jid.User != "120363426638900169" || jid.Server != "g.us" {
+		t.Fatalf("grupo válido parseado errado: %s", jid)
+	}
+	// número de pessoa no lugar do grupo: o engano que custa caro
+	for _, raw := range []string{
+		"",                             // campo esquecido
+		"5527998372363@s.whatsapp.net", // conversa de pessoa
+		"5527998372363",                // número solto (parseRecipientJID aceitaria)
+		"120363426638900169",           // id do grupo sem o @g.us
+		"status@broadcast",             // não é grupo
+	} {
+		if _, err := parseGroupJID(raw); err == nil {
+			t.Fatalf("parseGroupJID(%q) passou, devia recusar", raw)
+		}
+	}
+}
