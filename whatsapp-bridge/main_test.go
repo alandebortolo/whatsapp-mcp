@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -96,5 +99,32 @@ func TestParseGroupJID(t *testing.T) {
 		if _, err := parseGroupJID(raw); err == nil {
 			t.Fatalf("parseGroupJID(%q) passou, devia recusar", raw)
 		}
+	}
+}
+
+// Duas mídias no mesmo segundo ganham o mesmo nome na chegada; a segunda não pode devolver
+// o arquivo da primeira (19/09/2026).
+func TestMediaLocalPathSameSecondCollision(t *testing.T) {
+	dir := t.TempDir()
+	first, second := []byte("print da entrada de 100"), []byte("print da entrada de 200")
+	sum1, sum2 := sha256.Sum256(first), sha256.Sum256(second)
+	name := "image_20260919_093613.jpg"
+	base := filepath.Join(dir, name)
+
+	if got := mediaLocalPath(dir, name, "AAA", sum1[:]); got != base {
+		t.Fatalf("nada em disco: esperava o caminho padrão, veio %s", got)
+	}
+	if err := os.WriteFile(base, first, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := mediaLocalPath(dir, name, "AAA", sum1[:]); got != base {
+		t.Fatalf("arquivo da própria mensagem: esperava o caminho padrão, veio %s", got)
+	}
+	want := filepath.Join(dir, "image_20260919_093613_BBB.jpg")
+	if got := mediaLocalPath(dir, name, "BBB", sum2[:]); got != want {
+		t.Fatalf("colisão: esperava %s, veio %s", want, got)
+	}
+	if got := mediaLocalPath(dir, name, "BBB", nil); got != base {
+		t.Fatalf("sem sha256 no store: esperava o caminho padrão, veio %s", got)
 	}
 }

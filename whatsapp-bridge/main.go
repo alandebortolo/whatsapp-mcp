@@ -28,6 +28,7 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
+	"crypto/sha256"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -1761,7 +1762,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath = mediaLocalPath(chatDir, filename, messageID, fileSHA256)
+	filename = filepath.Base(localPath)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -1846,6 +1848,27 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// O nome gravado na chegada é "image_<AAAAMMDD_HHMMSS>.jpg": duas mídias no MESMO segundo
+// (quem manda dois prints de uma vez) ganham o mesmo nome, e o "já existe" devolvia o
+// arquivo da primeira como se fosse a segunda, calado (19/09/2026, simulações do Sealion).
+// Se o arquivo no caminho padrão não é o desta mensagem (sha256 diferente), ela vai para um
+// nome com o próprio ID. Quem já está no caminho padrão continua lá.
+func mediaLocalPath(chatDir, filename, messageID string, fileSHA256 []byte) string {
+	base := filepath.Join(chatDir, filename)
+	if len(fileSHA256) == 0 {
+		return base
+	}
+	data, err := os.ReadFile(base)
+	if err != nil {
+		return base
+	}
+	if sum := sha256.Sum256(data); bytes.Equal(sum[:], fileSHA256) {
+		return base
+	}
+	ext := filepath.Ext(filename)
+	return filepath.Join(chatDir, strings.TrimSuffix(filename, ext)+"_"+messageID+ext)
 }
 
 // O WhatsApp assina a URL da mídia com tokens (oh/oe) que vencem em ~3 meses, e mensagem
