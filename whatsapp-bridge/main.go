@@ -501,6 +501,41 @@ func extractTextContent(msg *waProto.Message) string {
 		}
 	}
 
+	// Localização e convite não têm Conversation: viram texto com link clicável.
+	if loc := msg.GetLocationMessage(); loc != nil {
+		var parts []string
+		for _, s := range []string{loc.GetName(), loc.GetAddress()} {
+			if s = strings.TrimSpace(s); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		out := strings.TrimSpace("[localização] " + strings.Join(parts, " — "))
+		if lat, lng := loc.GetDegreesLatitude(), loc.GetDegreesLongitude(); lat != 0 || lng != 0 {
+			out += " https://maps.google.com/?q=" + strconv.FormatFloat(lat, 'f', -1, 64) + "," + strconv.FormatFloat(lng, 'f', -1, 64)
+		}
+		if comment := strings.TrimSpace(loc.GetComment()); comment != "" {
+			out += "\n" + comment
+		}
+		return out
+	}
+	if loc := msg.GetLiveLocationMessage(); loc != nil {
+		out := strings.TrimSpace("[localização ao vivo] " + strings.TrimSpace(loc.GetCaption()))
+		if lat, lng := loc.GetDegreesLatitude(), loc.GetDegreesLongitude(); lat != 0 || lng != 0 {
+			out += " https://maps.google.com/?q=" + strconv.FormatFloat(lat, 'f', -1, 64) + "," + strconv.FormatFloat(lng, 'f', -1, 64)
+		}
+		return out
+	}
+	if invite := msg.GetGroupInviteMessage(); invite != nil {
+		out := strings.TrimSpace("[convite de grupo] " + strings.TrimSpace(invite.GetGroupName()))
+		if code := strings.TrimSpace(invite.GetInviteCode()); code != "" {
+			out += " https://chat.whatsapp.com/" + code
+		}
+		if caption := strings.TrimSpace(invite.GetCaption()); caption != "" {
+			out += "\n" + caption
+		}
+		return out
+	}
+
 	return interactiveText(msg)
 }
 
@@ -1344,6 +1379,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
+	msg = unwrapMessage(msg)
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
@@ -1351,8 +1387,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
-	// Check for video message
-	if vid := msg.GetVideoMessage(); vid != nil {
+	// Nota de vídeo (PTV) usa o mesmo payload e download do vídeo comum.
+	vid := msg.GetVideoMessage()
+	if vid == nil {
+		vid = msg.GetPtvMessage()
+	}
+	if vid != nil {
 		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}

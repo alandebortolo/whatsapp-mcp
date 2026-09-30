@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -131,5 +133,124 @@ func TestExtractTextContentContact(t *testing.T) {
 		if got := extractTextContent(tc.msg); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Localizações e convites também precisam de texto para não sumirem da conversa.
+func TestExtractTextContentLocationAndInvite(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  *waProto.Message
+		want string
+	}{
+		{"localização com nome e endereço", &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			Name:             proto.String(" Praça Central "),
+			Address:          proto.String(" Rua das Flores, 10 "),
+			DegreesLatitude:  proto.Float64(-23.55052),
+			DegreesLongitude: proto.Float64(-46.633308),
+		}}, "[localização] Praça Central — Rua das Flores, 10 https://maps.google.com/?q=-23.55052,-46.633308"},
+
+		{"só coordenadas", &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			DegreesLatitude:  proto.Float64(-23.5),
+			DegreesLongitude: proto.Float64(-46.6),
+		}}, "[localização] https://maps.google.com/?q=-23.5,-46.6"},
+
+		{"coordenadas zero", &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			DegreesLatitude:  proto.Float64(0),
+			DegreesLongitude: proto.Float64(0),
+		}}, "[localização]"},
+
+		{"só nome e comentário", &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			Name:    proto.String("Portaria"),
+			Comment: proto.String(" Entrada lateral "),
+		}}, "[localização] Portaria\nEntrada lateral"},
+
+		{"só endereço e latitude zero", &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			Address:          proto.String("Rua das Flores, 10"),
+			DegreesLatitude:  proto.Float64(0),
+			DegreesLongitude: proto.Float64(-46.6),
+		}}, "[localização] Rua das Flores, 10 https://maps.google.com/?q=0,-46.6"},
+
+		{"longitude zero e coordenada pequena", &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			DegreesLatitude:  proto.Float64(0.0000001),
+			DegreesLongitude: proto.Float64(0),
+		}}, "[localização] https://maps.google.com/?q=0.0000001,0"},
+
+		{"ao vivo", &waProto.Message{LiveLocationMessage: &waProto.LiveLocationMessage{
+			Caption:          proto.String(" Estou chegando "),
+			DegreesLatitude:  proto.Float64(-23.5),
+			DegreesLongitude: proto.Float64(-46.6),
+		}}, "[localização ao vivo] Estou chegando https://maps.google.com/?q=-23.5,-46.6"},
+
+		{"ao vivo só coordenadas", &waProto.Message{LiveLocationMessage: &waProto.LiveLocationMessage{
+			DegreesLatitude:  proto.Float64(0),
+			DegreesLongitude: proto.Float64(-46.6),
+		}}, "[localização ao vivo] https://maps.google.com/?q=0,-46.6"},
+
+		{"ao vivo coordenadas zero", &waProto.Message{LiveLocationMessage: &waProto.LiveLocationMessage{
+			DegreesLatitude:  proto.Float64(0),
+			DegreesLongitude: proto.Float64(0),
+		}}, "[localização ao vivo]"},
+
+		{"convite com código", &waProto.Message{GroupInviteMessage: &waProto.GroupInviteMessage{
+			GroupName:  proto.String(" Grupo de teste "),
+			InviteCode: proto.String(" CodigoTeste123 "),
+			Caption:    proto.String(" Entre aqui "),
+		}}, "[convite de grupo] Grupo de teste https://chat.whatsapp.com/CodigoTeste123\nEntre aqui"},
+
+		{"convite sem código", &waProto.Message{GroupInviteMessage: &waProto.GroupInviteMessage{
+			GroupName: proto.String("Grupo de teste"),
+			Caption:   proto.String("Entre aqui"),
+		}}, "[convite de grupo] Grupo de teste\nEntre aqui"},
+
+		{"convite vazio", &waProto.Message{GroupInviteMessage: &waProto.GroupInviteMessage{}}, "[convite de grupo]"},
+	}
+	for _, tc := range cases {
+		if got := extractTextContent(tc.msg); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+		wrapped := &waProto.Message{EphemeralMessage: &waProto.FutureProofMessage{Message: tc.msg}}
+		if got := extractTextContent(wrapped); got != tc.want {
+			t.Errorf("%s (envelope efêmero): got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Nota de vídeo usa os mesmos metadados de download do vídeo comum.
+func TestExtractMediaInfoPtv(t *testing.T) {
+	video := &waProto.VideoMessage{
+		URL:           proto.String("https://example.com/video.enc"),
+		MediaKey:      []byte{1, 2, 3},
+		FileSHA256:    []byte{4, 5, 6},
+		FileEncSHA256: []byte{7, 8, 9},
+		FileLength:    proto.Uint64(1234),
+	}
+	ptv := &waProto.Message{PtvMessage: video}
+	cases := []struct {
+		name string
+		msg  *waProto.Message
+	}{
+		{"ptv", ptv},
+		{"ptv em envelope", &waProto.Message{EphemeralMessage: &waProto.FutureProofMessage{
+			Message: &waProto.Message{ViewOnceMessageV2: &waProto.FutureProofMessage{Message: ptv}},
+		}}},
+		{"vídeo comum", &waProto.Message{VideoMessage: video}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(tc.msg)
+			if mediaType != "video" {
+				t.Fatalf("mediaType = %q, want %q", mediaType, "video")
+			}
+			if !strings.HasPrefix(filename, "video_") || !strings.HasSuffix(filename, ".mp4") {
+				t.Errorf("filename = %q, want video_*.mp4", filename)
+			}
+			if url != video.GetURL() || !bytes.Equal(mediaKey, video.GetMediaKey()) ||
+				!bytes.Equal(fileSHA256, video.GetFileSHA256()) || !bytes.Equal(fileEncSHA256, video.GetFileEncSHA256()) ||
+				fileLength != video.GetFileLength() {
+				t.Errorf("metadados alterados: url=%q, mediaKey=%v, sha256=%v, encSHA256=%v, length=%d",
+					url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+			}
+		})
 	}
 }
