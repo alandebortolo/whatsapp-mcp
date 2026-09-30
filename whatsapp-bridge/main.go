@@ -510,6 +510,10 @@ func contactText(name, vcard string) string {
 	var fields []string
 	for _, line := range strings.Split(vcard, "\n") {
 		u := strings.ToUpper(strings.TrimSpace(line))
+		// iPhone groups properties: "item1.TEL;waid=...:+55 ..." — drop the group prefix.
+		if i := strings.Index(u, "."); i > 0 && i < strings.IndexAny(u+":", ";:") {
+			u = u[i+1:]
+		}
 		if strings.HasPrefix(u, "TEL") || strings.HasPrefix(u, "EMAIL") {
 			if kv := strings.SplitN(line, ":", 2); len(kv) == 2 && strings.TrimSpace(kv[1]) != "" {
 				fields = append(fields, strings.TrimSpace(kv[1]))

@@ -118,6 +118,11 @@ func TestExtractTextContentContact(t *testing.T) {
 			},
 		}}, "[contato] Fulano: +55 11 1111-1111\n[contato] Beltrana: +55 22 2222-2222"},
 
+		{"vcard do iPhone agrupado (item1.TEL)", &waProto.Message{ContactMessage: &waProto.ContactMessage{
+			DisplayName: proto.String("Grasy"),
+			Vcard:       proto.String("BEGIN:VCARD\nVERSION:3.0\nN:;Grasy;;;\nFN:Grasy\nitem1.TEL;waid=5527999999999:+55 27 99999-9999\nitem1.X-ABLabel:Celular\nEND:VCARD"),
+		}}, "[contato] Grasy: +55 27 99999-9999"},
+
 		{"vcard vazio cai no nome", &waProto.Message{ContactMessage: &waProto.ContactMessage{
 			DisplayName: proto.String("Só Nome"),
 		}}, "[contato] Só Nome"},
