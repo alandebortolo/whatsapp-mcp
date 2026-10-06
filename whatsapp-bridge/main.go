@@ -2351,6 +2351,51 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		})
 	})
 
+	// POST /api/group/create — {"name":"...","participants":["5527999999999", ...]}.
+	// Nome até 25 caracteres (o WhatsApp devolve 406 acima disso). Quem não pôde ser
+	// adicionado direto (privacidade) volta com error != 0, igual ao /participants.
+	mux.HandleFunc("/api/group/create", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name         string   `json:"name"`
+			Participants []string `json:"participants"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" || len(req.Participants) == 0 {
+			http.Error(w, "name and participants are required", http.StatusBadRequest)
+			return
+		}
+		jids := make([]types.JID, 0, len(req.Participants))
+		for _, p := range req.Participants {
+			jid, err := parseRecipientJID(p)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid participant %q: %v", p, err), http.StatusBadRequest)
+				return
+			}
+			jids = append(jids, jid)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		info, err := client.CreateGroup(context.Background(), whatsmeow.ReqCreateGroup{Name: req.Name, Participants: jids})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		results := make([]map[string]interface{}, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			results = append(results, map[string]interface{}{"jid": p.JID.String(), "error": p.Error})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true, "group": info.JID.String(), "name": info.Name, "results": results,
+		})
+	})
+
 	// POST /api/group/leave — {"group":"...@g.us"}. Sair não tem desfazer: sem convite
 	// novo, este número não volta.
 	mux.HandleFunc("/api/group/leave", func(w http.ResponseWriter, r *http.Request) {
