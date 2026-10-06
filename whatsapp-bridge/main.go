@@ -2418,7 +2418,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			duration = time.Duration(*req.DurationHours * float64(time.Hour))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := client.SendAppState(context.Background(), appstate.BuildMute(chat, mute, duration)); err != nil {
+		if err := sendAppStateHealing(client, appstate.BuildMute(chat, mute, duration)); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
 			return
@@ -2431,6 +2431,36 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 			}
 		}
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: state + " " + chat.String()})
+	})
+
+	// Ressincroniza do zero uma coleção do app state (mute/pin/archive/...) cuja cópia local
+	// divergiu ("mismatching LTHash"): POST {"name":"regular_high"}; vazio = todas.
+	mux.HandleFunc("/api/appstate/resync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		names := appstate.AllPatchNames[:]
+		if req.Name != "" {
+			names = []appstate.WAPatchName{appstate.WAPatchName(req.Name)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var failed []string
+		for _, name := range names {
+			if err := resyncAppState(client, name); err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", name, err))
+			}
+		}
+		if len(failed) > 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: strings.Join(failed, "; ")})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: fmt.Sprintf("resynced %d collection(s)", len(names))})
 	})
 
 	// Presença por conversa ("digitando…"): cosmética, sem janela de horário — quem manda
@@ -2556,9 +2586,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		results := make([]map[string]any, 0, len(resp))
 		for _, item := range resp {
 			results = append(results, map[string]any{
-				"query": item.Query,
+				"query":          item.Query,
 				"is_on_whatsapp": item.IsIn,
-				"jid": item.JID.String(),
+				"jid":            item.JID.String(),
 			})
 		}
 		json.NewEncoder(w).Encode(map[string]any{"success": true, "results": results})
@@ -3262,4 +3292,52 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// sendAppStateHealing sends an app state patch (mute, pin, archive) and, when the
+// server refuses it because OUR copy of that collection drifted (409 conflict whose
+// patches fail with "mismatching LTHash"), throws the local copy away with a full
+// resync of that one collection and sends once more. Without it the chat could
+// never be muted again from here: whatsmeow's own 409 retry re-applies patches on
+// top of the broken hash and fails the same way (Alan, 06/10/2026, regular_high v130).
+func sendAppStateHealing(client *whatsmeow.Client, patch appstate.PatchInfo) error {
+	ctx := context.Background()
+	err := client.SendAppState(ctx, patch)
+	if err == nil || !(errors.Is(err, appstate.ErrMismatchingLTHash) || errors.Is(err, whatsmeow.ErrAppStateUpdate)) {
+		return err
+	}
+	fmt.Printf("app state %s out of sync (%v): full resync and retry\n", patch.Type, err)
+	if syncErr := resyncAppState(client, patch.Type); syncErr != nil {
+		return fmt.Errorf("%w (and the resync of %s failed: %v)", err, patch.Type, syncErr)
+	}
+	if retryErr := client.SendAppState(ctx, patch); retryErr != nil {
+		return fmt.Errorf("after a full resync of %s: %w", patch.Type, retryErr)
+	}
+	return nil
+}
+
+// resyncAppState rebuilds one app state collection from scratch. First from the
+// server's snapshot; when even that does not verify (the server's own history is
+// broken: measured 06/10/2026, regular_high failing at v130 after a full sync),
+// it asks the primary phone for a fresh snapshot (the "fatal recovery" request the
+// official companions send) and waits for whatsmeow to apply the answer.
+func resyncAppState(client *whatsmeow.Client, name appstate.WAPatchName) error {
+	ctx := context.Background()
+	err := client.FetchAppState(ctx, name, true, false)
+	if err == nil {
+		return nil
+	}
+	fmt.Printf("app state %s: full sync failed (%v), asking the phone for a snapshot\n", name, err)
+	if _, sendErr := client.SendPeerMessage(ctx, whatsmeow.BuildAppStateRecoveryRequest(name)); sendErr != nil {
+		return fmt.Errorf("%w (and asking the phone failed: %v)", err, sendErr)
+	}
+	before, _, _ := client.Store.AppState.GetAppStateVersion(ctx, string(name))
+	for i := 0; i < 15; i++ {
+		time.Sleep(2 * time.Second)
+		if v, _, vErr := client.Store.AppState.GetAppStateVersion(ctx, string(name)); vErr == nil && v > 0 && v != before {
+			fmt.Printf("app state %s recovered from the phone at v%d\n", name, v)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w (asked the phone for a snapshot; no answer in 30 s)", err)
 }
