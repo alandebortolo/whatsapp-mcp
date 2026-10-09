@@ -1361,6 +1361,14 @@ func sendWhatsAppChatPresence(client *whatsmeow.Client, recipient, state string)
 		if err := client.SendChatPresence(ctx, chat, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
 			return false, fmt.Sprintf("Error sending chat presence: %v", err)
 		}
+	case "recording":
+		// "gravando áudio…": antes de uma nota de voz, o que o outro lado veria de um humano
+		if err := client.SendPresence(ctx, types.PresenceAvailable); err != nil {
+			return false, fmt.Sprintf("Error sending presence: %v", err)
+		}
+		if err := client.SendChatPresence(ctx, chat, types.ChatPresenceComposing, types.ChatPresenceMediaAudio); err != nil {
+			return false, fmt.Sprintf("Error sending chat presence: %v", err)
+		}
 	case "paused":
 		if err := client.SendChatPresence(ctx, chat, types.ChatPresencePaused, types.ChatPresenceMediaText); err != nil {
 			return false, fmt.Sprintf("Error sending chat presence: %v", err)
@@ -1369,7 +1377,7 @@ func sendWhatsAppChatPresence(client *whatsmeow.Client, recipient, state string)
 			return false, fmt.Sprintf("Error sending presence: %v", err)
 		}
 	default:
-		return false, "state must be composing or paused"
+		return false, "state must be composing, recording or paused"
 	}
 	return true, fmt.Sprintf("Presence %s sent to %s", state, recipient)
 }
