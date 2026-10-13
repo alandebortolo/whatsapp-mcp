@@ -2404,6 +2404,54 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		})
 	})
 
+	// GET /api/group/info?jid=...@g.us — quem está no grupo (12/10: os agentes chutavam
+	// essa URL sem ela existir; o /api/groups só dá a contagem). Nome sai da agenda do
+	// número (FullName, senão PushName); "" quando o número nunca falou com a gente.
+	mux.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		group, err := parseGroupJID(r.URL.Query().Get("jid"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		info, err := client.GetGroupInfo(context.Background(), group)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		members := make([]map[string]interface{}, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			name := ""
+			for _, j := range []types.JID{p.PhoneNumber, p.JID, p.LID} {
+				if j.User == "" {
+					continue
+				}
+				if c, err := client.Store.Contacts.GetContact(context.Background(), j); err == nil {
+					if name = c.FullName; name == "" {
+						name = c.PushName
+					}
+				}
+				if name != "" {
+					break
+				}
+			}
+			members = append(members, map[string]interface{}{
+				"jid": p.JID.String(), "phone": p.PhoneNumber.User, "lid": p.LID.User,
+				"admin": p.IsAdmin || p.IsSuperAdmin, "superadmin": p.IsSuperAdmin, "name": name,
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true, "jid": info.JID.String(), "name": info.Name, "topic": info.Topic,
+			"owner": info.OwnerPN.User, "created": info.GroupCreated.Unix(),
+			"announce": info.IsAnnounce, "locked": info.IsLocked, "participants": members,
+		})
+	})
+
 	// POST /api/group/leave — {"group":"...@g.us"}. Sair não tem desfazer: sem convite
 	// novo, este número não volta.
 	mux.HandleFunc("/api/group/leave", func(w http.ResponseWriter, r *http.Request) {
