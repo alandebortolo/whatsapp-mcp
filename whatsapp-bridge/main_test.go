@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/types"
@@ -126,5 +128,19 @@ func TestMediaLocalPathSameSecondCollision(t *testing.T) {
 	}
 	if got := mediaLocalPath(dir, name, "BBB", nil); got != base {
 		t.Fatalf("sem sha256 no store: esperava o caminho padrão, veio %s", got)
+	}
+}
+
+func TestStickerMessageIsAStickerNotAnImage(t *testing.T) {
+	m := stickerMessage(whatsmeow.UploadResponse{URL: "u", DirectPath: "/d", FileLength: 9})
+	if m.GetMimetype() != "image/webp" || m.GetWidth() != 512 || m.GetHeight() != 512 || m.GetIsAnimated() {
+		t.Fatalf("figurinha errada: %+v", m)
+	}
+	if m.GetURL() != "u" || m.GetDirectPath() != "/d" || m.GetFileLength() != 9 {
+		t.Fatalf("upload não passou para a figurinha: %+v", m)
+	}
+	kind, name, _, _, _, _, _ := extractMediaInfo(&waProto.Message{StickerMessage: m})
+	if kind != "sticker" || !strings.HasSuffix(name, ".webp") {
+		t.Fatalf("o store leria como %q %q, não como figurinha", kind, name)
 	}
 }

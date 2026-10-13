@@ -967,6 +967,24 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
+// stickerMessage: figurinha de verdade (Clauditor, 13/10). O upload é o mesmo da imagem
+// (whatsmeow.MediaImage); muda o tipo da mensagem, que o WhatsApp desenha sem bolha.
+// As figurinhas do Clauditor saem em 512x512 (o tamanho do WhatsApp).
+func stickerMessage(resp whatsmeow.UploadResponse) *waProto.StickerMessage {
+	return &waProto.StickerMessage{
+		Mimetype:      proto.String("image/webp"),
+		URL:           proto.String(resp.URL),
+		DirectPath:    proto.String(resp.DirectPath),
+		MediaKey:      resp.MediaKey,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    proto.Uint64(resp.FileLength),
+		Width:         proto.Uint32(512),
+		Height:        proto.Uint32(512),
+		IsAnimated:    proto.Bool(false),
+	}
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient string   `json:"recipient"`
@@ -974,10 +992,11 @@ type SendMessageRequest struct {
 	MediaPath string   `json:"media_path,omitempty"`
 	ReplyTo   string   `json:"reply_to,omitempty"` // id de mensagem do histórico local: envia CITANDO ela
 	Mentions  []string `json:"mentions,omitempty"` // jids mencionados; o texto leva o token @<numero>
+	Sticker   bool     `json:"sticker,omitempty"`  // .webp sai como FIGURINHA (StickerMessage), não como foto
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo string, mentions []string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo string, mentions []string, sticker bool) (bool, string) {
 	if !whatsappSendAllowedAt(time.Now()) {
 		return false, whatsappQuietHoursMessage()
 	}
@@ -1073,8 +1092,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		fmt.Println("Media uploaded", resp)
 
 		// Create the appropriate message type based on media type
-		switch mediaType {
-		case whatsmeow.MediaImage:
+		switch {
+		case mediaType == whatsmeow.MediaImage && sticker && fileExt == "webp":
+			msg.StickerMessage = stickerMessage(resp)
+		case mediaType == whatsmeow.MediaImage:
 			msg.ImageMessage = &waProto.ImageMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
@@ -1085,7 +1106,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
-		case whatsmeow.MediaAudio:
+		case mediaType == whatsmeow.MediaAudio:
 			// Handle ogg audio files
 			var seconds uint32 = 30 // Default fallback
 			var waveform []byte = nil
@@ -1115,7 +1136,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
 			}
-		case whatsmeow.MediaVideo:
+		case mediaType == whatsmeow.MediaVideo:
 			msg.VideoMessage = &waProto.VideoMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
@@ -1126,7 +1147,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
-		case whatsmeow.MediaDocument:
+		case mediaType == whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
 				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
@@ -2144,7 +2165,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo, req.Mentions)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo, req.Mentions, req.Sticker)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
