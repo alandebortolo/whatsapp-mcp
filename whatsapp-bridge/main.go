@@ -2473,6 +2473,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		})
 	})
 
+	// GET /api/group/invite?jid=...@g.us — link de convite (precisa ser admin). É a saída
+	// quando o add volta 403: o número só aceita grupo de contato salvo.
+	mux.HandleFunc("/api/group/invite", func(w http.ResponseWriter, r *http.Request) {
+		group, err := parseGroupJID(r.URL.Query().Get("jid"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		link, err := client.GetGroupInviteLink(context.Background(), group, false)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "link": link})
+	})
+
 	// POST /api/group/leave — {"group":"...@g.us"}. Sair não tem desfazer: sem convite
 	// novo, este número não volta.
 	mux.HandleFunc("/api/group/leave", func(w http.ResponseWriter, r *http.Request) {
