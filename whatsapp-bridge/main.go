@@ -2313,7 +2313,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		})
 	})
 
-	// POST /api/group/participants — {"group":"...@g.us","action":"add"|"remove",
+	// POST /api/group/participants — {"group":"...@g.us","action":"add"|"remove"|"promote"|"demote",
 	// "participants":["5527999999999", ...]}
 	mux.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -2343,8 +2343,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		case "", "add":
 		case "remove":
 			action = whatsmeow.ParticipantChangeRemove
+		case "promote":
+			action = whatsmeow.ParticipantChangePromote
+		case "demote":
+			action = whatsmeow.ParticipantChangeDemote
 		default:
-			http.Error(w, "action must be add or remove", http.StatusBadRequest)
+			http.Error(w, "action must be add, remove, promote or demote", http.StatusBadRequest)
 			return
 		}
 		jids := make([]types.JID, 0, len(req.Participants))
