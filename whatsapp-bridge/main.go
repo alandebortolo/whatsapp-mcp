@@ -993,11 +993,12 @@ type SendMessageRequest struct {
 	ReplyTo   string   `json:"reply_to,omitempty"` // id de mensagem do histórico local: envia CITANDO ela
 	Mentions  []string `json:"mentions,omitempty"` // jids mencionados; o texto leva o token @<numero>
 	Sticker   bool     `json:"sticker,omitempty"`  // .webp sai como FIGURINHA (StickerMessage), não como foto
+	Manual    bool     `json:"manual,omitempty"`   // o Alan digitou e enviou pela tela do Clauditor: pula a janela de horário
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo string, mentions []string, sticker bool) (bool, string) {
-	if !whatsappSendAllowedAt(time.Now()) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo string, mentions []string, sticker bool, manual bool) (bool, string) {
+	if !manual && !whatsappSendAllowedAt(time.Now()) {
 		return false, whatsappQuietHoursMessage()
 	}
 	if !client.IsConnected() {
@@ -2165,7 +2166,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo, req.Mentions, req.Sticker)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo, req.Mentions, req.Sticker, req.Manual)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
