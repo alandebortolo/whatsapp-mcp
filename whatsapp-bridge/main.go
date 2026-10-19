@@ -29,6 +29,7 @@ import (
 
 	"bytes"
 	"crypto/sha256"
+	"regexp"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -1466,6 +1467,25 @@ var whisperModelPath = func() string {
 // áudios em rajada transcrevem em série. Subir o cap se virar gargalo.
 var transcribeSem = make(chan struct{}, 1)
 
+// Quem manda áudio nem sempre fala português: com "-l pt" fixo o whisper traduzia o
+// inglês do Rodolfo (19/10/2026). Detecta o idioma; fora desta lista é palpite ruim
+// (pt curto vira galego) e refaz em pt, como era antes.
+var whisperLangs = map[string]bool{"pt": true, "en": true, "es": true, "it": true}
+var detectedLangRe = regexp.MustCompile(`auto-detected language: (\w+)`)
+
+func whisperDetect(ctx context.Context, wav string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "/opt/homebrew/bin/whisper-cli",
+		"-m", whisperModelPath, "-f", wav, "-l", "auto", "-nt") // sem -np: o idioma sai no stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if m := detectedLangRe.FindSubmatch(stderr.Bytes()); err == nil && m != nil && whisperLangs[string(m[1])] {
+		return out, nil
+	}
+	return exec.CommandContext(ctx, "/opt/homebrew/bin/whisper-cli",
+		"-m", whisperModelPath, "-f", wav, "-l", "pt", "-nt", "-np").Output()
+}
+
 // transcribeAndReply baixa o áudio, transcreve via whisper.cpp local e
 // responde na própria conversa citando a mensagem de áudio.
 func transcribeAndReply(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, chat types.JID, logger waLog.Logger) {
@@ -1510,8 +1530,7 @@ func transcribeAndReply(client *whatsmeow.Client, messageStore *MessageStore, ms
 		return
 	}
 
-	out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/whisper-cli",
-		"-m", whisperModelPath, "-f", wav, "-l", "pt", "-nt", "-np").Output()
+	out, err := whisperDetect(ctx, wav)
 	if err != nil {
 		logger.Warnf("transcricao: whisper falhou: %v", err)
 		return
