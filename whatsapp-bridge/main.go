@@ -1294,6 +1294,93 @@ func sendWhatsAppReaction(client *whatsmeow.Client, messageStore *MessageStore, 
 	return true, "ok"
 }
 
+// sendWhatsAppPin fixa (ou desafixa) uma mensagem para todos na conversa (30/10/2026,
+// Alan: "fixar mensagens em grupos"). seconds é a duração que o WhatsApp oferece
+// (86400, 604800 ou 2592000); em grupo só-admins, o WhatsApp recusa quem não é admin.
+func sendWhatsAppPin(client *whatsmeow.Client, messageStore *MessageStore, recipient, messageID string, seconds uint32, unpin bool) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if strings.TrimSpace(messageID) == "" {
+		return false, "message_id is required"
+	}
+	if !unpin && seconds != 86400 && seconds != 604800 && seconds != 2592000 {
+		return false, "duração inválida: 86400 (24h), 604800 (7d) ou 2592000 (30d)"
+	}
+	chat, err := parseRecipientJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+	fromMe, sender, ok := messageStore.GetMessageMeta(messageID, chat.String())
+	if !ok {
+		return false, "mensagem alvo não está no histórico local"
+	}
+	kind := waProto.PinInChatMessage_PIN_FOR_ALL
+	if unpin {
+		kind = waProto.PinInChatMessage_UNPIN_FOR_ALL
+	}
+	msg := &waProto.Message{
+		PinInChatMessage: &waProto.PinInChatMessage{
+			Key:               client.BuildMessageKey(chat, targetSenderJID(chat, fromMe, sender), types.MessageID(messageID)),
+			Type:              kind.Enum(),
+			SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
+		},
+	}
+	if !unpin {
+		msg.MessageContextInfo = &waProto.MessageContextInfo{MessageAddOnDurationInSecs: proto.Uint32(seconds)}
+	}
+	if _, err := client.SendMessage(context.Background(), chat, msg); err != nil {
+		return false, fmt.Sprintf("Error sending pin: %v", err)
+	}
+	return true, "ok"
+}
+
+// applyGroupSettings muda o que vier preenchido (nil = não mexe) e para no primeiro erro,
+// dizendo o que já tinha mudado. Foto: caminho de um JPEG; "" remove a foto.
+func applyGroupSettings(client *whatsmeow.Client, group types.JID, name, description, photo *string, announce, locked *bool) ([]string, error) {
+	ctx := context.Background()
+	done := []string{}
+	if name != nil {
+		if err := client.SetGroupName(ctx, group, *name); err != nil {
+			return done, fmt.Errorf("nome: %w", err)
+		}
+		done = append(done, "name")
+	}
+	if description != nil {
+		if err := client.SetGroupDescription(ctx, group, *description); err != nil {
+			return done, fmt.Errorf("descrição: %w", err)
+		}
+		done = append(done, "description")
+	}
+	if photo != nil {
+		var data []byte
+		if *photo != "" {
+			b, err := os.ReadFile(*photo)
+			if err != nil {
+				return done, fmt.Errorf("foto: %w", err)
+			}
+			data = b
+		}
+		if _, err := client.SetGroupPhoto(ctx, group, data); err != nil {
+			return done, fmt.Errorf("foto: %w", err)
+		}
+		done = append(done, "photo")
+	}
+	if announce != nil {
+		if err := client.SetGroupAnnounce(ctx, group, *announce); err != nil {
+			return done, fmt.Errorf("só admins enviam: %w", err)
+		}
+		done = append(done, "announce")
+	}
+	if locked != nil {
+		if err := client.SetGroupLocked(ctx, group, *locked); err != nil {
+			return done, fmt.Errorf("só admins editam: %w", err)
+		}
+		done = append(done, "locked")
+	}
+	return done, nil
+}
+
 // sendWhatsAppRevoke apaga "para todos" uma mensagem NOSSA (o WhatsApp só deixa o autor
 // apagar; admin de grupo apagando alheio fica de fora de propósito). O revoke que nós
 // mandamos não volta como events.Message, então a marca local é gravada aqui.
@@ -2452,6 +2539,69 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindA
 	// GET /api/group/info?jid=...@g.us — quem está no grupo (12/10: os agentes chutavam
 	// essa URL sem ela existir; o /api/groups só dá a contagem). Nome sai da agenda do
 	// número (FullName, senão PushName); "" quando o número nunca falou com a gente.
+	mux.HandleFunc("/api/pin", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient"`
+			MessageID string `json:"message_id"`
+			Seconds   uint32 `json:"seconds"`
+			Unpin     bool   `json:"unpin"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Seconds == 0 {
+			req.Seconds = 604800 // o padrão do WhatsApp: 7 dias
+		}
+		success, message := sendWhatsAppPin(client, messageStore, req.Recipient, req.MessageID, req.Seconds, req.Unpin)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	mux.HandleFunc("/api/group/settings", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			JID         string  `json:"jid"`
+			Name        *string `json:"name"`
+			Description *string `json:"description"`
+			Photo       *string `json:"photo"`
+			Announce    *bool   `json:"announce"`
+			Locked      *bool   `json:"locked"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		group, err := parseGroupJID(req.JID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Not connected to WhatsApp"})
+			return
+		}
+		done, err := applyGroupSettings(client, group, req.Name, req.Description, req.Photo, req.Announce, req.Locked)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error(), "done": done})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "ok", "done": done})
+	})
+
 	mux.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
