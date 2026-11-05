@@ -128,7 +128,7 @@ func acquireInstanceLock(storeDir string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open instance lock: %v", err)
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := lockExclusive(lockFile); err != nil {
 		lockFile.Close()
 		return nil, fmt.Errorf("another bridge is already using store %s", storeDir)
 	}
@@ -3001,7 +3001,7 @@ func main() {
 		return
 	}
 	defer func() {
-		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		unlockFile(lockFile)
 		lockFile.Close()
 	}()
 
