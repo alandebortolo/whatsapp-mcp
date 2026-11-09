@@ -246,6 +246,88 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// MergeChat funde a conversa gravada no LID (`from`) na do telefone (`to`): a 1ª mensagem de
+// um contato novo chega como LID antes de o lid_map existir, e o resto vai pro telefone —
+// sem isto a mesma pessoa aparece duas vezes na lista (Kalleo/DM Brasil, 18185856741/USA, 09/11).
+// Retorna quantas mensagens mudaram de conversa; `from` inexistente = 0, sem erro.
+func (store *MessageStore) MergeChat(from, to string) (int64, error) {
+	if from == "" || to == "" || from == to {
+		return 0, nil
+	}
+	var fromName string
+	var fromTime time.Time
+	if err := store.db.QueryRow("SELECT coalesce(name,''), last_message_time FROM chats WHERE jid = ?", from).
+		Scan(&fromName, &fromTime); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	tx, err := store.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	// destino primeiro (FK de messages.chat_jid); o horário fica o mais novo dos dois
+	if _, err = tx.Exec(`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET last_message_time = max(coalesce(last_message_time, ''), excluded.last_message_time)`,
+		to, fromName, fromTime); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec("UPDATE OR IGNORE messages SET chat_jid = ? WHERE chat_jid = ?", to, from)
+	if err != nil {
+		return 0, err
+	}
+	moved, _ := res.RowsAffected()
+	// sobra = mesma mensagem já gravada nos dois lados (id igual): a cópia do LID sai
+	if _, err = tx.Exec("UPDATE OR IGNORE reactions SET chat_jid = ? WHERE chat_jid = ?", to, from); err != nil {
+		return 0, err
+	}
+	for _, q := range []string{
+		"DELETE FROM messages WHERE chat_jid = ?",
+		"DELETE FROM reactions WHERE chat_jid = ?",
+		"DELETE FROM chats WHERE jid = ?",
+	} {
+		if _, err = tx.Exec(q, from); err != nil {
+			return 0, err
+		}
+	}
+	return moved, tx.Commit()
+}
+
+// mergeLIDChats varre as conversas ainda gravadas em LID e funde cada uma no telefone que o
+// lid_map já conhece. Roda ao conectar: conserta o que ficou partido antes deste código.
+func mergeLIDChats(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE jid LIKE '%@lid'")
+	if err != nil {
+		logger.Warnf("merge LID: %v", err)
+		return
+	}
+	var lids []string
+	for rows.Next() {
+		var j string
+		if rows.Scan(&j) == nil {
+			lids = append(lids, j)
+		}
+	}
+	rows.Close()
+	for _, l := range lids {
+		jid, err := types.ParseJID(l)
+		if err != nil {
+			continue
+		}
+		pn := resolveJID(client, jid)
+		if pn.Server == types.HiddenUserServer {
+			continue // sem mapa ainda: fica no LID até o WhatsApp contar o telefone
+		}
+		if n, err := store.MergeChat(l, pn.ToNonAD().String()); err != nil {
+			logger.Warnf("merge LID %s -> %s: %v", l, pn, err)
+		} else {
+			logger.Infof("merge LID %s -> %s: %d mensagens", l, pn, n)
+		}
+	}
+}
+
 // Marca atividade no chat sem destruir o nome já conhecido: o nome só é gravado
 // quando a linha nasce (chat novo, iniciado por nós). StoreChat é INSERT OR REPLACE
 // e sobrescreveria um nome bom pelo fallback, então não serve pro caminho de envio.
@@ -1226,7 +1308,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// grava, e ele só roda no recebimento. Sem isto a mensagem sai no WhatsApp e nunca
 	// entra no store: a thread fica só com o lado deles. Mesmos extratores do
 	// handleMessage, pra gravar idêntico ao caminho de recebimento.
-	chatJID := recipientJID.String()
+	// LID resolvido pro telefone: gravar no LID partia a conversa em duas na lista
+	chatJID := resolveJID(client, recipientJID).ToNonAD().String()
+	if recipientJID.Server == types.HiddenUserServer && chatJID != recipientJID.String() {
+		messageStore.MergeChat(recipientJID.String(), chatJID)
+	}
 
 	// TouchChat ANTES do StoreMessage: o db abre com _foreign_keys=on e messages.chat_jid
 	// referencia chats.jid, então numa conversa nova (iniciada por nós) a mensagem seria
@@ -1719,6 +1805,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chat := resolveJID(client, msg.Info.Chat)
 	chatJID := chat.String()
 	sender := resolveJID(client, msg.Info.Sender).User
+	if msg.Info.Chat.Server == types.HiddenUserServer && chat.Server != types.HiddenUserServer {
+		// o mapa acabou de aparecer: o que ficou gravado no LID vem pra cá
+		if _, err := messageStore.MergeChat(msg.Info.Chat.ToNonAD().String(), chatJID); err != nil {
+			logger.Warnf("merge LID %s -> %s: %v", msg.Info.Chat, chatJID, err)
+		}
+	}
 
 	// Reação não é mensagem: grava na tabela própria e sai sem tocar last_message_time
 	// (a prévia da caixa continua sendo a última mensagem de verdade). EncReaction
@@ -3063,6 +3155,7 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			go mergeLIDChats(client, messageStore, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")

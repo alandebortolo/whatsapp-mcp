@@ -144,3 +144,48 @@ func TestStickerMessageIsAStickerNotAnImage(t *testing.T) {
 		t.Fatalf("o store leria como %q %q, não como figurinha", kind, name)
 	}
 }
+
+// Conversa partida LID x telefone vira uma só: mensagens e reações migram, a cópia
+// repetida (mesmo id nos dois lados) some, o chat LID sai e o horário fica o mais novo.
+func TestMergeChat(t *testing.T) {
+	store, err := NewMessageStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lid, pn := "209796401733712@lid", "556492149026@s.whatsapp.net"
+	t0 := time.Date(2026, 11, 9, 23, 53, 0, 0, time.UTC)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(store.StoreChat(pn, "Kalleo", t0))
+	must(store.StoreChat(lid, "209796401733712", t0.Add(time.Minute)))
+	must(store.StoreMessage("A", pn, "556492149026", "oi", t0, false, "", "", "", nil, nil, nil, 0, "", "", ""))
+	must(store.StoreMessage("B", lid, "me", "boa noite", t0.Add(time.Minute), true, "", "", "", nil, nil, nil, 0, "", "", ""))
+	must(store.StoreMessage("A", lid, "556492149026", "oi", t0, false, "", "", "", nil, nil, nil, 0, "", "", ""))
+	must(store.StoreReaction(lid, "B", "556492149026", "👍", t0, false))
+
+	n, err := store.MergeChat(lid, pn)
+	must(err)
+	if n != 1 {
+		t.Fatalf("moved=%d, want 1", n)
+	}
+	var msgs, chats, reacts int
+	store.db.QueryRow("SELECT count(*) FROM messages WHERE chat_jid=?", pn).Scan(&msgs)
+	store.db.QueryRow("SELECT count(*) FROM chats").Scan(&chats)
+	store.db.QueryRow("SELECT count(*) FROM reactions WHERE chat_jid=?", pn).Scan(&reacts)
+	if msgs != 2 || chats != 1 || reacts != 1 {
+		t.Fatalf("msgs=%d chats=%d reacts=%d, want 2/1/1", msgs, chats, reacts)
+	}
+	var left int
+	store.db.QueryRow("SELECT count(*) FROM messages WHERE chat_jid=?", lid).Scan(&left)
+	if left != 0 {
+		t.Fatalf("sobrou %d no LID", left)
+	}
+	if n, err := store.MergeChat(lid, pn); err != nil || n != 0 {
+		t.Fatalf("2ª fusão: n=%d err=%v", n, err)
+	}
+}
