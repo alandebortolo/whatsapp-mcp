@@ -2314,6 +2314,7 @@ func extractDirectPathFromURL(url string) string {
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, bindAddress string, port int, accountName string) error {
 	mux := http.NewServeMux()
+	registerCallRoutes(mux, client)
 
 	// Read-only status endpoint used to verify that each isolated account is healthy.
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -3138,6 +3139,9 @@ func main() {
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
+		if handleCallEvent(client, evt) { // ligação recebida ao vivo (calls_ring.go)
+			return
+		}
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
